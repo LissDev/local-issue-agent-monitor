@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $script:IssueMonitorStateVersion = 1
 $script:GitHubApiVersion = '2022-11-28'
 $script:GitHubUserAgent = 'local-issue-agent-monitor-v0'
+$script:GitHubCredentialTarget = 'local-issue-agent-monitor/github-issues'
 
 function Get-IssueMonitorConfig {
     [CmdletBinding()]
@@ -22,6 +23,10 @@ function Get-IssueMonitorConfig {
     }
     catch {
         throw "Configuration file '$Path' is not valid JSON. JSON does not support comments or trailing commas."
+    }
+
+    if ($null -ne $config.PSObject.Properties['githubCredentialTarget'] -and [string]$config.githubCredentialTarget -ne $script:GitHubCredentialTarget) {
+        throw "Configuration file '$Path' cannot change githubCredentialTarget. The monitor always uses '$script:GitHubCredentialTarget'."
     }
 
     $repositories = @()
@@ -615,6 +620,7 @@ function Request-IssueLaunchAgentLabel {
         [Parameter(Mandatory)]$Issue,
         [Parameter(Mandatory)]$Launch,
         [Parameter(Mandatory)][ValidateSet('running', 'done', 'needs-human', 'failed')][string]$Status,
+        [ValidateSet('run', 'running')][string]$CurrentAgentStatus,
         [switch]$WhatIf,
         [scriptblock]$LabelRequestScript
     )
@@ -622,7 +628,7 @@ function Request-IssueLaunchAgentLabel {
         return [pscustomobject]@{ Requested = $false; Reason = if ($WhatIf) { 'what-if' } else { 'launch-disabled' }; Label = $null }
     }
     $label = if ($Status -eq 'running') { 'agent:running' } else { 'agent:' + $Status }
-    $removeLabel = if ($Status -eq 'running') { 'agent:run' } else { 'agent:running' }
+    $removeLabel = if ($PSBoundParameters.ContainsKey('CurrentAgentStatus')) { 'agent:' + $CurrentAgentStatus } elseif ($Status -eq 'running') { 'agent:run' } else { 'agent:running' }
     if ($null -eq $LabelRequestScript) { throw 'No label request seam was supplied; no GitHub label API call was made.' }
     & $LabelRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label
     return [pscustomobject]@{ Requested = $true; Reason = 'requested'; Label = $label }
@@ -705,17 +711,104 @@ function Save-IssueMonitorState {
     }
 }
 
-function Get-GitHubRequestHeaders {
+function Get-GitHubCredentialTarget {
     [CmdletBinding()]
     param()
 
-    $token = $env:GITHUB_ISSUES_TOKEN
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw 'GITHUB_ISSUES_TOKEN is not set. In this PowerShell window, set it with: $env:GITHUB_ISSUES_TOKEN = ''github_pat_...'''
+    return $script:GitHubCredentialTarget
+}
+
+function Read-WindowsGenericCredential {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Target)
+
+    # Credential Manager exposes passwords only through the Win32 API.  Keep
+    # the interop local to this function so callers receive only a result.
+    if ($null -eq ('IssueMonitor.CredentialNativeMethods' -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace IssueMonitor {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NativeCredential {
+        public UInt32 Flags;
+        public UInt32 Type;
+        public IntPtr TargetName;
+        public IntPtr Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public UInt32 CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public UInt32 Persist;
+        public UInt32 AttributeCount;
+        public IntPtr Attributes;
+        public IntPtr TargetAlias;
+        public IntPtr UserName;
     }
+
+    public static class CredentialNativeMethods {
+        [DllImport("Advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool CredRead(string target, UInt32 type, UInt32 flags, out IntPtr credential);
+
+        [DllImport("Advapi32.dll", SetLastError = true)]
+        public static extern void CredFree(IntPtr credential);
+    }
+}
+'@ -ErrorAction Stop
+        }
+        catch {
+            throw "Windows Credential Manager is unavailable. Could not load the Windows credential API: $($_.Exception.Message)"
+        }
+    }
+
+    $credentialPointer = [IntPtr]::Zero
+    if (-not [IssueMonitor.CredentialNativeMethods]::CredRead($Target, 1, 0, [ref]$credentialPointer)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($errorCode -eq 1168) { return [pscustomobject]@{ State = 'missing'; Password = $null } }
+        throw "Windows Credential Manager could not read Generic Credential '$Target' (Windows error $errorCode)."
+    }
+
+    try {
+        $credential = [Runtime.InteropServices.Marshal]::PtrToStructure($credentialPointer, [type][IssueMonitor.NativeCredential])
+        if ($credential.CredentialBlob -eq [IntPtr]::Zero -or $credential.CredentialBlobSize -eq 0) {
+            return [pscustomobject]@{ State = 'empty'; Password = $null }
+        }
+        $password = [Runtime.InteropServices.Marshal]::PtrToStringUni($credential.CredentialBlob, [int]($credential.CredentialBlobSize / 2)).TrimEnd([char]0)
+        return [pscustomobject]@{ State = 'available'; Password = $password }
+    }
+    finally {
+        if ($credentialPointer -ne [IntPtr]::Zero) { [IssueMonitor.CredentialNativeMethods]::CredFree($credentialPointer) }
+    }
+}
+
+function Get-GitHubIssuesToken {
+    [CmdletBinding()]
+    param([scriptblock]$CredentialReadScript)
+
+    $target = Get-GitHubCredentialTarget
+    try {
+        $credential = if ($null -ne $CredentialReadScript) { & $CredentialReadScript -Target $target } else { Read-WindowsGenericCredential -Target $target }
+    }
+    catch {
+        throw "Could not access Generic Credential '$target' for GitHub Issues. $($_.Exception.Message)"
+    }
+    if ($null -eq $credential -or [string]$credential.State -eq 'missing') {
+        throw "GitHub credential '$target' was not found. In Windows Credential Manager, add a Generic Credential with this exact Internet or network address and put the GitHub token in Password."
+    }
+    if ([string]$credential.State -ne 'available' -or [string]::IsNullOrWhiteSpace([string]$credential.Password)) {
+        throw "GitHub credential '$target' is unavailable or has an empty password. Recreate the Generic Credential for the current Windows user."
+    }
+    return [string]$credential.Password
+}
+
+function Get-GitHubRequestHeaders {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Token)
+
     @{
         Accept                 = 'application/vnd.github+json'
-        Authorization           = "Bearer $token"
+        Authorization           = "Bearer $Token"
         'X-GitHub-Api-Version' = $script:GitHubApiVersion
         'User-Agent'           = $script:GitHubUserAgent
     }
@@ -744,12 +837,13 @@ function Get-HeaderValue {
 function Get-GitHubRequestFailureMessage {
     param(
         [Parameter(Mandatory)]$ErrorRecord,
-        [Parameter(Mandatory)][string]$Repository
+        [Parameter(Mandatory)][string]$Repository,
+        [AllowNull()][string]$Token
     )
 
     $message = $ErrorRecord.Exception.Message
-    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ISSUES_TOKEN)) {
-        $message = $message.Replace($env:GITHUB_ISSUES_TOKEN, '[redacted]')
+    if (-not [string]::IsNullOrWhiteSpace($Token)) {
+        $message = $message.Replace($Token, '[redacted]')
     }
     $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
     $response = if ($null -ne $responseProperty) { $responseProperty.Value } else { $null }
@@ -778,6 +872,19 @@ function Get-GitHubRequestFailureMessage {
         }
         return "GitHub API rate limit was reached while reading '$Repository'.$retryHint"
     }
+    if ($statusCode -eq 401) {
+        return "GitHub rejected credential '$script:GitHubCredentialTarget' while accessing '$Repository'. Check that the token is valid and has not expired."
+    }
+    if ($statusCode -eq 403) {
+        $sso = Get-HeaderValue -Headers $responseHeaders -Name 'X-GitHub-SSO'
+        if (-not [string]::IsNullOrWhiteSpace([string]$sso)) {
+            return "GitHub requires SSO authorization for '$Repository'. Authorize credential '$script:GitHubCredentialTarget' for the organization, then run the monitor again."
+        }
+        return "GitHub denied access to '$Repository'. Confirm credential '$script:GitHubCredentialTarget' can access the repository and has Issues: Read and write."
+    }
+    if ($statusCode -eq 404) {
+        return "GitHub could not access '$Repository'. Confirm credential '$script:GitHubCredentialTarget' can access the repository and has Issues: Read and write."
+    }
     return "GitHub Issues request failed for '$Repository': $message"
 }
 
@@ -800,10 +907,11 @@ function Invoke-GitHubIssuesPage {
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository,
         [Parameter(Mandatory)][uri]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [AllowNull()][string]$Token,
         [scriptblock]$InvokeRestMethodScript
     )
 
-    $headers = Get-GitHubRequestHeaders
     try {
         if ($null -ne $InvokeRestMethodScript) {
             # Test seam: return either @{ Items = ...; Headers = ... } or a raw API item array.
@@ -819,7 +927,7 @@ function Invoke-GitHubIssuesPage {
         }
     }
     catch {
-        throw (Get-GitHubRequestFailureMessage -ErrorRecord $_ -Repository $Repository)
+        throw (Get-GitHubRequestFailureMessage -ErrorRecord $_ -Repository $Repository -Token $Token)
     }
 
     [pscustomobject]@{
@@ -866,9 +974,13 @@ function Get-GitHubIssues {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository,
+        [string]$GitHubToken,
+        [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $nextUrl = "https://api.github.com/repos/$encodedRepository/issues?state=open&sort=updated&direction=desc&per_page=100"
     $result = [System.Collections.Generic.List[object]]::new()
@@ -876,7 +988,7 @@ function Get-GitHubIssues {
     while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
         $pageCount++
         if ($pageCount -gt 1000) { throw "GitHub pagination for '$Repository' exceeded a safe limit." }
-        $page = Invoke-GitHubIssuesPage -Repository $Repository -Uri $nextUrl -InvokeRestMethodScript $InvokeRestMethodScript
+        $page = Invoke-GitHubIssuesPage -Repository $Repository -Uri $nextUrl -Headers $headers -Token $GitHubToken -InvokeRestMethodScript $InvokeRestMethodScript
         foreach ($item in $page.Items) {
             if ($null -eq $item -or $null -ne $item.PSObject.Properties['pull_request']) { continue }
             [void]$result.Add((ConvertTo-MonitoredIssue -Issue $item -Repository $Repository))
@@ -884,6 +996,38 @@ function Get-GitHubIssues {
         $nextUrl = $page.NextPageUrl
     }
     return @($result)
+}
+
+function Invoke-GitHubIssueLabelUpdate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$IssueNumber,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RemoveLabel,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AddLabel,
+        [string]$GitHubToken,
+        [scriptblock]$CredentialReadScript,
+        [scriptblock]$InvokeRestMethodScript
+    )
+
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    $headers = Get-GitHubRequestHeaders -Token $GitHubToken
+    $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+    $baseUri = "https://api.github.com/repos/$encodedRepository/issues/$IssueNumber/labels"
+    try {
+        if ($null -ne $InvokeRestMethodScript) {
+            & $InvokeRestMethodScript -Uri $baseUri -Headers $headers -Method 'Post' -Body (@{ labels = @($AddLabel) } | ConvertTo-Json -Compress) | Out-Null
+            & $InvokeRestMethodScript -Uri ($baseUri + '/' + [uri]::EscapeDataString($RemoveLabel)) -Headers $headers -Method 'Delete' -Body $null | Out-Null
+        }
+        else {
+            # Add before delete so a failed delete preserves agent:run instead of losing the request.
+            Invoke-RestMethod -Uri $baseUri -Headers $headers -Method Post -ContentType 'application/json' -Body (@{ labels = @($AddLabel) } | ConvertTo-Json -Compress) -ErrorAction Stop | Out-Null
+            Invoke-RestMethod -Uri ($baseUri + '/' + [uri]::EscapeDataString($RemoveLabel)) -Headers $headers -Method Delete -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        throw (Get-GitHubRequestFailureMessage -ErrorRecord $_ -Repository $Repository -Token $GitHubToken)
+    }
 }
 
 function Get-IssueMonitorEvents {
@@ -951,15 +1095,18 @@ function Invoke-IssueMonitorPoll {
         [Parameter(Mandatory)][psobject]$Config,
         [string]$StatePath = (Get-IssueMonitorStatePath),
         [switch]$DoNotSaveState,
+        [string]$GitHubToken,
+        [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
     $state = Read-IssueMonitorState -Path $StatePath
     $events = [System.Collections.Generic.List[object]]::new()
     $successfulRepositoryCount = 0
     foreach ($repository in $Config.Repositories) {
         try {
-            $issues = @(Get-GitHubIssues -Repository $repository -InvokeRestMethodScript $InvokeRestMethodScript)
+            $issues = @(Get-GitHubIssues -Repository $repository -GitHubToken $GitHubToken -InvokeRestMethodScript $InvokeRestMethodScript)
             $evaluation = Get-IssueMonitorEvents -Issues $issues -WatchedLabels $Config.WatchedLabels -State $state
             $state = $evaluation.State
             foreach ($event in $evaluation.Events) { [void]$events.Add($event) }
@@ -975,7 +1122,7 @@ function Invoke-IssueMonitorPoll {
 
 Export-ModuleMember -Function @(
     'Get-IssueMonitorConfig', 'Test-IssueMonitorConfiguration', 'Get-IssueMonitorStatePath', 'Read-IssueMonitorState', 'Get-IssueMonitorState',
-    'Save-IssueMonitorState', 'Invoke-GitHubIssuesPage', 'Get-GitHubIssues',
+    'Save-IssueMonitorState', 'Get-GitHubCredentialTarget', 'Get-GitHubIssuesToken', 'Invoke-GitHubIssuesPage', 'Get-GitHubIssues', 'Invoke-GitHubIssueLabelUpdate',
     'ConvertTo-MonitoredIssue', 'Get-IssueMonitorEvents', 'Get-IssueMonitorEvent',
     'New-IssueMonitorErrorEvent', 'Invoke-IssueMonitorPoll',
     'Get-IssueLaunchStatePath', 'ConvertTo-IssueMonitorLaunchConfiguration', 'Test-IssueMonitorLaunchConfiguration',

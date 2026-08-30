@@ -19,7 +19,6 @@ function Protect-MonitorText {
     param([AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
     $safe = $Text
-    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ISSUES_TOKEN)) { $safe = $safe.Replace($env:GITHUB_ISSUES_TOKEN, '[redacted]') }
     $safe = $safe -replace '(?i)bearer\s+[^\s"'']+', 'Bearer [redacted]'
     $safe = $safe -replace '(?i)(github_pat|gh[pousr])_[A-Za-z0-9_\-]+', '[redacted]'
     $safe = $safe -replace '(?i)sk-[A-Za-z0-9_\-]+', '[redacted]'
@@ -74,14 +73,8 @@ function Get-LaunchJsonlStatus {
 }
 
 function Invoke-AgentLabelUpdate {
-    param([Parameter(Mandatory)][string]$Repository, [Parameter(Mandatory)][int]$IssueNumber, [Parameter(Mandatory)][string]$RemoveLabel, [Parameter(Mandatory)][string]$AddLabel)
-    if ([string]::IsNullOrWhiteSpace($env:GITHUB_ISSUES_TOKEN)) { throw 'GITHUB_ISSUES_TOKEN is not set; agent labels were not changed.' }
-    $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
-    $baseUri = "https://api.github.com/repos/$encodedRepository/issues/$IssueNumber/labels"
-    $headers = @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:GITHUB_ISSUES_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'local-issue-agent-monitor' }
-    # Add before delete so a failed delete preserves agent:run instead of losing the request.
-    Invoke-RestMethod -Uri $baseUri -Headers $headers -Method Post -ContentType 'application/json' -Body (@{ labels = @($AddLabel) } | ConvertTo-Json -Compress) -ErrorAction Stop | Out-Null
-    Invoke-RestMethod -Uri ($baseUri + '/' + [uri]::EscapeDataString($RemoveLabel)) -Headers $headers -Method Delete -ErrorAction Stop | Out-Null
+    param([Parameter(Mandatory)][string]$Repository, [Parameter(Mandatory)][int]$IssueNumber, [Parameter(Mandatory)][string]$RemoveLabel, [Parameter(Mandatory)][string]$AddLabel, [Parameter(Mandatory)][string]$GitHubToken)
+    Invoke-GitHubIssueLabelUpdate -Repository $Repository -IssueNumber $IssueNumber -RemoveLabel $RemoveLabel -AddLabel $AddLabel -GitHubToken $GitHubToken
 }
 function Set-LaunchProperty {
     param([Parameter(Mandatory)]$Launch, [Parameter(Mandatory)][string]$Name, $Value)
@@ -89,10 +82,14 @@ function Set-LaunchProperty {
     if ($null -eq $property) { $Launch | Add-Member -NotePropertyName $Name -NotePropertyValue $Value } else { $property.Value = $Value }
 }
 function Invoke-LaunchLabelTransition {
-    param([Parameter(Mandatory)]$Issue, [Parameter(Mandatory)]$Launch, [Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Status)
-    if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or [string]$Launch.labelStatus -eq $Status) { return $false }
+    param([Parameter(Mandatory)]$Issue, [Parameter(Mandatory)]$Launch, [Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Status, [Parameter(Mandatory)][string]$GitHubToken)
+    $labelStatusProperty = $Launch.PSObject.Properties['labelStatus']
+    $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
+    if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or $currentLabelStatus -eq $Status) { return $false }
     try {
-        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -LabelRequestScript ${function:Invoke-AgentLabelUpdate} | Out-Null
+        $removeAgentStatus = if ($currentLabelStatus -eq 'running') { 'running' } else { 'run' }
+        $labelUpdate = { param($Repository, $IssueNumber, $RemoveLabel, $AddLabel) Invoke-AgentLabelUpdate -Repository $Repository -IssueNumber $IssueNumber -RemoveLabel $RemoveLabel -AddLabel $AddLabel -GitHubToken $GitHubToken }.GetNewClosure()
+        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus $removeAgentStatus -LabelRequestScript $labelUpdate | Out-Null
         Set-LaunchProperty $Launch 'labelStatus' $Status; return $true
     } catch { Write-LaunchEvent 'failed' $Issue ('GitHub label update failed; local process was left untouched: ' + $_.Exception.Message); return $false }
 }
@@ -114,7 +111,7 @@ function Invoke-StopTrackedIssue {
 }
 
 function Invoke-LaunchMonitoring {
-    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$PollResult)
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$PollResult, [Parameter(Mandatory)][string]$GitHubToken)
     if (-not [bool]$Config.Launch.Enabled) {
         foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
             if (@($event.Issue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0) { Write-LaunchEvent 'queued' $event.Issue 'agent:run is visible, but launch.enabled is false. No local or GitHub change was made.' }
@@ -124,11 +121,26 @@ function Invoke-LaunchMonitoring {
     $state = Read-IssueLaunchState -Path $Config.Launch.StatePath; $stateChanged = $false
     foreach ($launch in @($state.launches)) {
         $keyIssue = [pscustomobject]@{ Repository = [string]$launch.repository; Number = [int]$launch.issueNumber }
-        if ([string]$launch.status -ne 'running') { Write-LaunchEvent ([string]$launch.status) $keyIssue 'tracked launch'; continue }
+        if ([string]$launch.status -ne 'running') {
+            Write-LaunchEvent ([string]$launch.status) $keyIssue 'tracked launch'
+            if ([string]$launch.status -in @('done', 'needs-human', 'failed')) {
+                $labelStatusProperty = $launch.PSObject.Properties['labelStatus']
+                $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
+                if ($currentLabelStatus -ne [string]$launch.status) {
+                    if (Invoke-LaunchLabelTransition $keyIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
+                }
+            }
+            continue
+        }
+        $labelStatusProperty = $launch.PSObject.Properties['labelStatus']
+        $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
+        if ($currentLabelStatus -ne 'running') {
+            if (Invoke-LaunchLabelTransition $keyIssue $launch $Config 'running' $GitHubToken) { $stateChanged = $true }
+        }
         $jsonl = Get-LaunchJsonlStatus $launch
         if ($jsonl.Status -ne 'running') {
             Set-LaunchProperty $launch 'status' $jsonl.Status; $stateChanged = $true; Write-LaunchEvent $jsonl.Status $keyIssue $jsonl.Detail
-            if ($jsonl.Status -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $jsonl.Status) { $stateChanged = $true } }
+            if ($jsonl.Status -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $jsonl.Status $GitHubToken) { $stateChanged = $true } }
         }
     }
     # A completed child can disappear before the next poll.  Parse its JSONL
@@ -162,24 +174,26 @@ function Invoke-LaunchMonitoring {
             $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $process.Id -LogPath $process.LogPath -ProcessStartedAt $process.StartedAt; Set-LaunchProperty $metadata 'runnerPath' $process.RunnerPath
             $state.launches = @($state.launches) + @($metadata); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
             Write-LaunchEvent 'running' $issue ('Started tracked PID ' + $metadata.pid + '.')
-            [void](Invoke-LaunchLabelTransition $issue $metadata $Config 'running'); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
+            [void](Invoke-LaunchLabelTransition $issue $metadata $Config 'running' $GitHubToken); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
         } catch { Write-LaunchEvent 'failed' $issue $_.Exception.Message }
     }
 }
 function Invoke-MonitorIteration {
+    param([scriptblock]$CredentialReadScript)
     try { $config = Get-IssueMonitorConfig -Path $ConfigPath } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false } }
     if ($PSCmdlet.ParameterSetName -eq 'Stop') {
         try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
     }
-    if ([string]::IsNullOrWhiteSpace($env:GITHUB_ISSUES_TOKEN)) { Write-MonitorMessage "GITHUB_ISSUES_TOKEN is not set. In this PowerShell window, set it with: `$env:GITHUB_ISSUES_TOKEN = 'github_pat_...'"; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
     try {
+        $gitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript
         $noStateWrite = [bool]$WhatIf -or -not [bool]$config.Launch.Enabled
-        $result = Invoke-IssueMonitorPoll -Config $config -DoNotSaveState:$noStateWrite; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result
+        $result = Invoke-IssueMonitorPoll -Config $config -GitHubToken $gitHubToken -DoNotSaveState:$noStateWrite; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result $gitHubToken
         if ($result.SuccessfulRepositoryCount -eq 0) { Write-MonitorMessage 'No repository could be checked. Review the error rows above; local state was not changed.'; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
         return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true }
     } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
 }
 
+if ($MyInvocation.InvocationName -eq '.') { return }
 if (-not $Watch) { [void](Invoke-MonitorIteration); return }
 Write-Host 'local-issue-agent-monitor v1 is watching. Press Ctrl+C to stop.'
 while ($true) { $iteration = Invoke-MonitorIteration; Write-Host ('Next attempt UTC: {0:u}' -f [DateTimeOffset]::UtcNow.AddSeconds($iteration.PollIntervalSeconds)); Start-Sleep -Seconds $iteration.PollIntervalSeconds }

@@ -38,23 +38,35 @@ function New-RawIssue {
 
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('issue-monitor-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
-$savedToken = $env:GITHUB_ISSUES_TOKEN
+$testToken = 'test-token-not-printed'
 
 try {
     # Normalization and GitHub list behavior: pull requests in /issues responses are excluded.
-    $env:GITHUB_ISSUES_TOKEN = 'test-token-not-printed'
+    $credentialTarget = Get-GitHubCredentialTarget
+    Assert-Equal $credentialTarget 'local-issue-agent-monitor/github-issues' 'The credential target is fixed'
+    $credentialToken = Get-GitHubIssuesToken -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'available'; Password = $testToken } }
+    Assert-Equal $credentialToken $testToken 'Credential lookup returns the Generic Credential password'
+    $missingCredentialMessage = ''
+    try { Get-GitHubIssuesToken -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'missing'; Password = $null } } | Out-Null } catch { $missingCredentialMessage = $_.Exception.Message }
+    Assert-True ($missingCredentialMessage -match [regex]::Escape($credentialTarget)) 'Missing credential names the required Generic Credential'
+    $unavailableCredentialMessage = ''
+    try { Get-GitHubIssuesToken -CredentialReadScript { param($Target) throw 'credential store unavailable' } | Out-Null } catch { $unavailableCredentialMessage = $_.Exception.Message }
+    Assert-True ($unavailableCredentialMessage -match 'Could not access Generic Credential') 'Credential store failures are understandable'
+
     $rawIssue = New-RawIssue
     $rawPullRequest = New-RawIssue -Number 43 -Title 'A pull request'
     $rawPullRequest | Add-Member -NotePropertyName pull_request -NotePropertyValue ([pscustomobject]@{})
     $mockRequest = {
         param($Uri, $Headers, $Repository)
+        $script:readAuthorization = $Headers.Authorization
         [pscustomobject]@{ Items = @($rawIssue, $rawPullRequest); Headers = @{} }
     }
-    $issues = @(Get-GitHubIssues -Repository 'example-org/example-repo' -InvokeRestMethodScript $mockRequest)
+    $issues = @(Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $mockRequest)
     Assert-Equal $issues.Count 1 'Pull requests must not be reported as Issues'
     Assert-Equal $issues[0].Number 42 'Issue number is normalized'
     Assert-Equal $issues[0].Repository 'example-org/example-repo' 'Repository is attached to normalized Issue'
     Assert-Equal ($issues[0].Labels -join ',') 'status:ready' 'Labels are normalized'
+    Assert-Equal $script:readAuthorization ('Bearer ' + $testToken) 'Credential token authorizes Issue reads'
 
     # GitHub REST pagination follows a rel="next" URL without accessing the network.
     $script:pageRequests = 0
@@ -71,14 +83,14 @@ try {
             [pscustomobject]@{ Items = @(New-RawIssue -Number 51); Headers = @{} }
         }
     }
-    $pagedIssues = @(Get-GitHubIssues -Repository 'example-org/example-repo' -InvokeRestMethodScript $pagedRequest)
+    $pagedIssues = @(Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $pagedRequest)
     Assert-Equal $script:pageRequests 2 'The next page is requested exactly once'
     Assert-Equal $pagedIssues.Count 2 'Issues from every requested page are returned'
 
     $emptyPollConfig = [pscustomobject]@{
         Repositories = @('example-org/example-repo'); WatchedLabels = @('status:ready'); PollIntervalSeconds = 60
     }
-    $emptyPoll = Invoke-IssueMonitorPoll -Config $emptyPollConfig -StatePath (Join-Path $temporaryRoot 'empty-state.json') -InvokeRestMethodScript {
+    $emptyPoll = Invoke-IssueMonitorPoll -Config $emptyPollConfig -GitHubToken $testToken -StatePath (Join-Path $temporaryRoot 'empty-state.json') -InvokeRestMethodScript {
         param($Uri, $Headers, $Repository) [pscustomobject]@{ Items = @(); Headers = @{} }
     }
     Assert-Equal $emptyPoll.SuccessfulRepositoryCount 1 'An empty Issues response is a successful poll'
@@ -111,18 +123,21 @@ try {
     $invalidConfigFailed = $false
     try { Get-IssueMonitorConfig -Path $invalidConfigPath | Out-Null } catch { $invalidConfigFailed = $true }
     Assert-True $invalidConfigFailed 'Invalid configuration is rejected locally'
+    $wrongCredentialTargetPath = Join-Path $temporaryRoot 'wrong-credential-target.json'
+    [System.IO.File]::WriteAllText($wrongCredentialTargetPath, '{"githubCredentialTarget":"not-allowed","repositories":["example-org/example-repo"],"watchedLabels":["status:ready"]}')
+    $wrongCredentialTargetFailed = $false
+    try { Get-IssueMonitorConfig -Path $wrongCredentialTargetPath | Out-Null } catch { $wrongCredentialTargetFailed = $true }
+    Assert-True $wrongCredentialTargetFailed 'The configured credential target cannot override the fixed target'
 
-    # A missing token rejects a request before the injected HTTP seam is called.
-    $env:GITHUB_ISSUES_TOKEN = ''
+    # A missing Generic Credential rejects a request before the injected HTTP seam is called.
     $script:requestCalled = $false
     $shouldNotRun = { param($Uri, $Headers, $Repository) $script:requestCalled = $true; @() }
-    $missingTokenFailed = $false
-    try { Get-GitHubIssues -Repository 'example-org/example-repo' -InvokeRestMethodScript $shouldNotRun | Out-Null } catch { $missingTokenFailed = $true }
-    Assert-True $missingTokenFailed 'Missing token is rejected'
-    Assert-True (-not $script:requestCalled) 'Missing token does not make an HTTP request'
+    $missingCredentialFailed = $false
+    try { Get-GitHubIssues -Repository 'example-org/example-repo' -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'missing'; Password = $null } } -InvokeRestMethodScript $shouldNotRun | Out-Null } catch { $missingCredentialFailed = $true }
+    Assert-True $missingCredentialFailed 'Missing credential is rejected'
+    Assert-True (-not $script:requestCalled) 'Missing credential does not make an HTTP request'
 
     # A failed repository becomes an error event, while the remaining repositories are still polled.
-    $env:GITHUB_ISSUES_TOKEN = 'test-token-not-printed'
     $twoRepositoryConfig = [pscustomobject]@{
         Repositories = @('example-org/failing-repo', 'example-org/example-repo')
         WatchedLabels = @('status:ready')
@@ -133,10 +148,40 @@ try {
         if ($Repository -eq 'example-org/failing-repo') { throw 'GitHub API rate limit exceeded' }
         [pscustomobject]@{ Items = @(New-RawIssue -Number 60); Headers = @{} }
     }
-    $mixedPoll = Invoke-IssueMonitorPoll -Config $twoRepositoryConfig -StatePath (Join-Path $temporaryRoot 'mixed-state.json') -InvokeRestMethodScript $mixedRequest
+    $mixedPoll = Invoke-IssueMonitorPoll -Config $twoRepositoryConfig -GitHubToken $testToken -StatePath (Join-Path $temporaryRoot 'mixed-state.json') -InvokeRestMethodScript $mixedRequest
     Assert-Equal $mixedPoll.SuccessfulRepositoryCount 1 'Polling continues after one repository fails'
     Assert-Equal $mixedPoll.Events[0].Status 'error' 'A failed repository is reported as an error event'
     Assert-True ($mixedPoll.Events[0].Message -match 'rate limit') 'Rate-limit errors are understandable'
+
+    # Authentication, permissions, and SSO failures are specific and never echo the secret.
+    $unauthorizedRequest = {
+        param($Uri, $Headers, $Repository)
+        $exception = [Exception]::new("Bearer $testToken was rejected")
+        $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 401; Headers = @{} })
+        throw $exception
+    }
+    $unauthorizedMessage = ''
+    try { Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $unauthorizedRequest | Out-Null } catch { $unauthorizedMessage = $_.Exception.Message }
+    Assert-True ($unauthorizedMessage -match 'valid') 'Invalid GitHub token explains the corrective action'
+    Assert-True ($unauthorizedMessage -notmatch [regex]::Escape($testToken)) 'Invalid-token message does not reveal the token'
+    $ssoRequest = {
+        param($Uri, $Headers, $Repository)
+        $exception = [Exception]::new('forbidden')
+        $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 403; Headers = @{ 'X-GitHub-SSO' = 'required' } })
+        throw $exception
+    }
+    $ssoMessage = ''
+    try { Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $ssoRequest | Out-Null } catch { $ssoMessage = $_.Exception.Message }
+    Assert-True ($ssoMessage -match 'SSO') 'SSO requirement explains the corrective action'
+    $notFoundRequest = {
+        param($Uri, $Headers, $Repository)
+        $exception = [Exception]::new('not found')
+        $exception | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 404; Headers = @{} })
+        throw $exception
+    }
+    $notFoundMessage = ''
+    try { Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $notFoundRequest | Out-Null } catch { $notFoundMessage = $_.Exception.Message }
+    Assert-True ($notFoundMessage -match 'Issues: Read and write') 'Repository-access failure explains the required permission'
 
     # v1 launch eligibility is opt-in and requires the exact label envelope.
     $repositoryPath = Join-Path $temporaryRoot 'source-repository'
@@ -234,6 +279,19 @@ try {
     Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'done' -LabelRequestScript $fakeLabel | Out-Null
     Assert-Equal $script:lastRemovedLabel 'agent:running' 'A terminal transition replaces agent:running'
     Assert-Equal $script:lastAddedLabel 'agent:done' 'A terminal transition adds only agent:done'
+    Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'done' -CurrentAgentStatus 'run' -LabelRequestScript $fakeLabel | Out-Null
+    Assert-Equal $script:lastRemovedLabel 'agent:run' 'Recovered terminal transition can replace the original run label'
+    Assert-Equal $script:lastAddedLabel 'agent:done' 'Recovered terminal transition preserves the terminal result'
+    $script:labelHttpCalls = 0
+    $labelHttpRequest = {
+        param($Uri, $Headers, $Method, $Body)
+        $script:labelHttpCalls++
+        $script:labelAuthorization = $Headers.Authorization
+        [pscustomobject]@{}
+    }
+    Invoke-GitHubIssueLabelUpdate -Repository 'example-org/example-repo' -IssueNumber 77 -RemoveLabel 'agent:run' -AddLabel 'agent:running' -GitHubToken $testToken -InvokeRestMethodScript $labelHttpRequest
+    Assert-Equal $script:labelHttpCalls 2 'Credential token authorizes both label API requests'
+    Assert-Equal $script:labelAuthorization ('Bearer ' + $testToken) 'Credential token authorizes agent label updates'
 
     # The real Git fixture is entirely under the temporary test directory.  It
     # verifies that a clean local repository receives a genuinely isolated
@@ -257,13 +315,13 @@ try {
     Assert-Equal (& git -C $fixtureWorktree.Path branch --show-current) $fixturePlan.Branch 'The disposable worktree uses the exact computed branch'
 
     $readOnlyStatePath = Join-Path $temporaryRoot 'read-only-poll.json'
-    Invoke-IssueMonitorPoll -Config $emptyPollConfig -StatePath $readOnlyStatePath -DoNotSaveState -InvokeRestMethodScript {
+    Invoke-IssueMonitorPoll -Config $emptyPollConfig -GitHubToken $testToken -StatePath $readOnlyStatePath -DoNotSaveState -InvokeRestMethodScript {
         param($Uri, $Headers, $Repository) [pscustomobject]@{ Items = @(New-RawIssue -Number 80); Headers = @{} }
     } | Out-Null
     Assert-True (-not (Test-Path -LiteralPath $readOnlyStatePath)) 'A successful read-only poll writes no normal monitor state'
 
-    # Source the CLI against a disabled test configuration.  The invocation has
-    # no token, performs no network call, and proves its WhatIf path does not
+    # Source the CLI against a disabled test configuration.  A missing credential
+    # performs no network call, and proves its failure path does not
     # create a worktree, launch state, or child process.  Its JSONL renderer is
     # then checked for terminal states and secret redaction.
     $cliConfigPath = Join-Path $temporaryRoot 'cli-disabled.json'
@@ -273,8 +331,9 @@ try {
         launch = [pscustomobject]@{ enabled = $false; worktreeDirectory = (Join-Path $temporaryRoot 'cli-no-write\worktrees'); statePath = $cliStatePath; codexCommand = 'fake-codex'; repositoryPaths = @{} }
     }
     [IO.File]::WriteAllText($cliConfigPath, ($cliConfig | ConvertTo-Json -Depth 5))
-    $env:GITHUB_ISSUES_TOKEN = ''
     . (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $cliConfigPath -WhatIf
+    $cliIteration = Invoke-MonitorIteration -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'missing'; Password = $null } }
+    Assert-True (-not $cliIteration.Succeeded) 'CLI stops before polling when the credential is missing'
     Assert-True (-not (Test-Path -LiteralPath (Split-Path -Path $cliStatePath -Parent))) 'CLI WhatIf with disabled launch creates no launch-state directory'
     $jsonlFixture = Join-Path $temporaryRoot 'render.jsonl'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
@@ -289,6 +348,5 @@ try {
     Write-Host "PASS: $script:assertions assertions succeeded (no network requests)."
 }
 finally {
-    $env:GITHUB_ISSUES_TOKEN = $savedToken
     if (Test-Path -LiteralPath $temporaryRoot) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
 }

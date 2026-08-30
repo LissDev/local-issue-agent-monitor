@@ -38,14 +38,22 @@ For each monitored repository, add a matching entry in
 repository.  The example is deliberately non-runnable until these paths are
 changed.
 
-Set `GITHUB_ISSUES_TOKEN` in the PowerShell window only.  Use a fine-grained
-token limited to the monitored repositories with **Issues: Read and write**:
-read access lists Issues, and write access changes only the monitor's
-`agent:*` labels after an actual process start or terminal result.
+The example configuration deliberately contains no token or credential value.
+The monitor always reads one fixed Generic Credential from Windows Credential
+Manager: `local-issue-agent-monitor/github-issues`. It does not read
+`GITHUB_ISSUES_TOKEN`, so a new PowerShell window needs no environment setup.
 
-```powershell
-$env:GITHUB_ISSUES_TOKEN = 'github_pat_...'
-```
+Create the credential for the current Windows user before the first poll:
+
+1. Open **Credential Manager** → **Windows Credentials** → **Add a generic credential**.
+2. Enter `local-issue-agent-monitor/github-issues` as the Internet or network address.
+3. Put a fine-grained GitHub token in **Password**. The user-name field is not used by the monitor.
+
+Limit the token to the monitored repositories and grant **Issues: Read and
+write**. Read access lists Issues; write access changes only the monitor's
+`agent:*` labels after an actual process start or terminal result. The Generic
+Credential belongs to the current Windows user; another Windows user must
+create their own credential.
 
 The Codex CLI must already be signed in with the user's ChatGPT subscription.
 This monitor does not use an OpenAI API key, API billing, or a copied desktop
@@ -109,8 +117,8 @@ Do this only with a disposable, ready test Issue and a clean local repository:
 
 1. Copy `config.example.json`, set absolute paths, and leave `launch.enabled`
    false.
-2. Set the scoped read/write GitHub token and confirm `codex` is signed in with
-   the intended ChatGPT subscription.
+2. Create the scoped read/write GitHub Generic Credential described above and
+   confirm `codex` is signed in with the intended ChatGPT subscription.
 3. Run `-WhatIf` and verify the displayed branch and new worktree path.
 4. Change only `launch.enabled` to `true`; put exactly `type:feat`,
    `status:ready`, and `agent:run` on the test Issue.
@@ -122,7 +130,8 @@ Do this only with a disposable, ready test Issue and a clean local repository:
 ## Self-check
 
 The tests use no network, no Pester, no real Git, and no real Codex process; a
-fake runner emits JSONL through the Core seam.
+fake runner emits JSONL through the Core seam. Credential Manager and GitHub
+requests are also replaced by offline test seams.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1

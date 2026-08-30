@@ -2,12 +2,22 @@
 
 ## Credentials and Codex sign-in
 
-`GITHUB_ISSUES_TOKEN` is read only from the current PowerShell process
-environment.  Do not put it in `config.json`, the repository, a JSONL file, or
-a command line.  The token needs **Issues: Read and write** on only the
-repositories being monitored: listing Issues needs read access, while the
-monitor changes only `agent:run` to an agent lifecycle label after an actual
-launch or terminal result.
+The monitor reads its GitHub token only from the Generic Credential named
+`local-issue-agent-monitor/github-issues` in Windows Credential Manager. It
+does not read `GITHUB_ISSUES_TOKEN`. Create it manually in **Credential
+Manager** → **Windows Credentials** → **Add a generic credential**: use the
+exact name above as the Internet or network address and put the fine-grained
+GitHub token in **Password**. The user-name field is not used.
+
+The credential is bound to the current Windows user. It is not a shared system
+credential, so each Windows user who runs the monitor must create their own.
+Do not put the token in `config.json`, the repository, a JSONL file, a command
+line, a PowerShell environment variable, or a registry value. The token needs
+access only to the monitored repositories and **Issues: Read and write**:
+reading lists Issues, while writing changes only `agent:run` to an agent
+lifecycle label after an actual launch or terminal result. If GitHub rejects
+the token, its repository permissions, or required organization SSO, the
+monitor prints a corrective message without printing the token.
 
 The Codex CLI uses the existing local ChatGPT subscription sign-in.  Do not add
 an OpenAI API key, API billing value, or a copied ChatGPT Desktop session to the
@@ -23,12 +33,13 @@ repository and protect it with the normal permissions of the current Windows
 user.
 
 Launch metadata contains repository, Issue number, branch, worktree path, PID,
-timestamps, lifecycle status, and JSONL log path.  It intentionally contains no
-GitHub token or Codex authentication material.  Console and JSONL summaries
-redact bearer values, GitHub token-shaped strings, OpenAI-style keys, and common
-`Authorization`/`token` assignments before displaying them.  Treat raw JSONL as
-potentially sensitive anyway: it is an external tool log and should not be
-shared without review.
+timestamps, lifecycle status, and JSONL log path. It intentionally contains no
+GitHub token or Codex authentication material. The credential is kept only in
+the monitor process while it makes GitHub requests; it is not passed to the
+Codex child process. Console and JSONL summaries redact bearer values, GitHub
+token-shaped strings, OpenAI-style keys, and common `Authorization`/`token`
+assignments before displaying them. Treat raw JSONL as potentially sensitive
+anyway: it is an external tool log and should not be shared without review.
 
 ## Failure and interruption
 

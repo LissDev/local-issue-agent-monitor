@@ -2,6 +2,7 @@
   "repositories": [
     "example-org/example-repo"
   ],
+  "githubCredentialTarget": "local-issue-agent-monitor/github-issues",
   "pollIntervalSeconds": 60,
   "watchedLabels": [
     "status:ready",
