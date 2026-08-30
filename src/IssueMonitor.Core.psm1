@@ -195,6 +195,10 @@ function Get-IssueLaunchEligibility {
     if (-not [bool]$Launch.Enabled) {
         return [pscustomobject]@{ Eligible = $false; Reason = 'launch-disabled'; Type = $null }
     }
+    $issueState = if ($null -ne $Issue.PSObject.Properties['State']) { ([string]$Issue.State).ToLowerInvariant() } else { 'open' }
+    if ($issueState -ne 'open') {
+        return [pscustomobject]@{ Eligible = $false; Reason = 'issue-not-open'; Type = $null }
+    }
     $labels = @($Issue.Labels | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
     $types = @($labels | Where-Object { $_ -match '^type:[a-z0-9][a-z0-9-]*$' })
     if ($types.Count -ne 1) { return [pscustomobject]@{ Eligible = $false; Reason = 'requires-exactly-one-type-label'; Type = $null } }
@@ -619,6 +623,9 @@ function Start-IssueLaunchProcess {
 `$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
 `$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
 `$codex = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$codexBase64'))
+`$utf8NoBom = [Text.UTF8Encoding]::new(`$false)
+[Console]::OutputEncoding = `$utf8NoBom
+`$OutputEncoding = `$utf8NoBom
 function Protect-LaunchLogLine {
     param([AllowNull()][string]`$Text)
     if (`$null -eq `$Text) { return '' }
@@ -1017,6 +1024,7 @@ function ConvertTo-MonitoredIssue {
     $number = if ($null -ne $Issue.PSObject.Properties['number']) { $Issue.number } else { $null }
     $title = if ($null -ne $Issue.PSObject.Properties['title']) { $Issue.title } else { $null }
     $body = if ($null -ne $Issue.PSObject.Properties['body'] -and $null -ne $Issue.body) { $Issue.body } else { '' }
+    $state = if ($null -ne $Issue.PSObject.Properties['state'] -and -not [string]::IsNullOrWhiteSpace([string]$Issue.state)) { ([string]$Issue.state).ToLowerInvariant() } else { 'open' }
     if ($null -eq $number -or [string]::IsNullOrWhiteSpace([string]$title)) {
         throw "GitHub returned an invalid Issue for '$Repository': number and title are required."
     }
@@ -1035,6 +1043,7 @@ function ConvertTo-MonitoredIssue {
         Repository = $Repository
         Title     = [string]$title
         Body      = [string]$body
+        State     = $state
         Type      = 'issue'
         Labels    = @($labels)
         UpdatedAt = $updatedAt.ToUniversalTime().ToString('o')
@@ -1054,7 +1063,7 @@ function Get-GitHubIssues {
     if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
     $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
-    $nextUrl = "https://api.github.com/repos/$encodedRepository/issues?state=open&sort=updated&direction=desc&per_page=100"
+    $nextUrl = "https://api.github.com/repos/$encodedRepository/issues?state=all&sort=updated&direction=desc&per_page=100"
     $result = [System.Collections.Generic.List[object]]::new()
     $pageCount = 0
     while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {

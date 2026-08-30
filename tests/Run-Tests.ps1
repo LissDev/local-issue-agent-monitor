@@ -28,10 +28,11 @@ function New-RawIssue {
         [string]$Title = 'Prepare monitor',
         [string]$Body = '',
         [string[]]$Labels = @('status:ready'),
+        [ValidateSet('open', 'closed')][string]$State = 'open',
         [string]$UpdatedAt = '2026-08-30T09:00:00Z'
     )
     [pscustomobject]@{
-        number = $Number; title = $Title; body = $Body; updated_at = $UpdatedAt; state = 'open'
+        number = $Number; title = $Title; body = $Body; updated_at = $UpdatedAt; state = $State
         html_url = "https://github.com/example-org/example-repo/issues/$Number"
         labels = @($Labels | ForEach-Object { [pscustomobject]@{ name = $_ } })
     }
@@ -59,7 +60,7 @@ try {
     $rawPullRequest | Add-Member -NotePropertyName pull_request -NotePropertyValue ([pscustomobject]@{})
     $mockRequest = {
         param($Uri, $Headers, $Repository)
-        $script:readAuthorization = $Headers.Authorization
+        $script:readAuthorization = $Headers.Authorization; $script:readUri = $Uri
         [pscustomobject]@{ Items = @($rawIssue, $rawPullRequest); Headers = @{} }
     }
     $issues = @(Get-GitHubIssues -Repository 'example-org/example-repo' -GitHubToken $testToken -InvokeRestMethodScript $mockRequest)
@@ -68,7 +69,9 @@ try {
     Assert-Equal $issues[0].Repository 'example-org/example-repo' 'Repository is attached to normalized Issue'
     Assert-Equal ($issues[0].Labels -join ',') 'status:ready' 'Labels are normalized'
     Assert-Equal $issues[0].Body '' 'Issue body is normalized even when empty'
+    Assert-Equal $issues[0].State 'open' 'Issue state is normalized'
     Assert-Equal $script:readAuthorization ('Bearer ' + $testToken) 'Credential token authorizes Issue reads'
+    Assert-True ($script:readUri -match 'state=all') 'GitHub reads open and closed Issues'
 
     # GitHub REST pagination follows a rel="next" URL without accessing the network.
     $script:pageRequests = 0
@@ -201,6 +204,8 @@ try {
     $launchIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 77 -Title 'Safe isolated launch' -Body $issueBody -Labels @('type:feat', 'status:ready', 'agent:run', 'priority:high'))
     Assert-Equal (Get-IssueLaunchEligibility -Issue $launchIssue -Launch $disabledLaunch).Reason 'launch-disabled' 'Disabled launch never becomes eligible'
     Assert-True (Get-IssueLaunchEligibility -Issue $launchIssue -Launch $enabledLaunch).Eligible 'The full launch label envelope is eligible'
+    $closedLaunchIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 80 -State closed -Labels @('type:feat', 'status:ready', 'agent:run'))
+    Assert-Equal (Get-IssueLaunchEligibility -Issue $closedLaunchIssue -Launch $enabledLaunch).Reason 'issue-not-open' 'A closed Issue cannot launch a new agent'
     $missingType = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 78 -Labels @('status:ready', 'agent:run'))
     Assert-Equal (Get-IssueLaunchEligibility -Issue $missingType -Launch $enabledLaunch).Reason 'requires-exactly-one-type-label' 'A type label is mandatory'
     $twoTypes = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 79 -Labels @('type:feat', 'type:fix', 'status:ready', 'agent:run'))
@@ -259,6 +264,7 @@ try {
     Assert-Equal $script:fakeRunnerWorkingDirectory $plan.WorktreePath 'The fake runner is confined to the newly created worktree'
     $coreSource = Get-Content -LiteralPath (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Raw
     Assert-True ($coreSource -match 'function Protect-LaunchLogLine') 'The generated runner redacts credential-shaped JSONL values before writing its external log'
+    Assert-True ($coreSource -match '\[Console\]::OutputEncoding' -and $coreSource -match '\$OutputEncoding') 'The generated runner reads Codex output as UTF-8 before writing JSONL'
     Assert-True ($coreSource -match "EnvironmentVariables.Remove\('GITHUB_ISSUES_TOKEN'\)") 'The generated child process explicitly removes the GitHub token environment variable'
     $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
     Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
@@ -362,6 +368,14 @@ try {
     }
     [IO.File]::WriteAllText($cliConfigPath, ($cliConfig | ConvertTo-Json -Depth 5))
     . (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $cliConfigPath -WhatIf
+    $script:IsActivityMonitor = $true; $script:ActivityMonitorCompletedIssueKeys.Clear()
+    $closedTrackedIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 81 -State closed)
+    $closedLaunchState = [pscustomobject]@{ launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 81; status = 'needs-human'; pid = 999 }) }
+    $closedResolution = Remove-ClosedIssueLaunches -State $closedLaunchState -Issues @($closedTrackedIssue)
+    Assert-True $closedResolution.Changed 'A closed terminal Issue is removed from tracked launch state'
+    Assert-Equal @($closedResolution.State.launches).Count 0 'A closed terminal Issue is no longer tracked after the current session update'
+    Assert-Equal @(Get-ActivityMonitorCompletionSummary)[0].Count 1 'A closed tracked Issue is counted as completed in the current session'
+    $script:IsActivityMonitor = $false; $script:ActivityMonitorCompletedIssueKeys.Clear()
     $cliIteration = Invoke-MonitorIteration -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'missing'; Password = $null } }
     Assert-True (-not $cliIteration.Succeeded) 'CLI stops before polling when the credential is missing'
     Assert-True (-not (Test-Path -LiteralPath (Split-Path -Path $cliStatePath -Parent))) 'CLI WhatIf with disabled launch creates no launch-state directory'
@@ -371,16 +385,28 @@ try {
     Assert-Equal $rendered.Status 'needs-human' 'JSONL maps a human intervention event to needs-human'
     Assert-True ($rendered.Detail -notmatch 'github_pat_secret_value') 'JSONL credentials are redacted before display'
     Assert-True ($rendered.Activity -notmatch 'github_pat_secret_value') 'Latest JSONL activity is redacted before display'
+    $utf8Activity = -join @([char]0x0410, [char]0x0433, [char]0x0435, [char]0x043d, [char]0x0442, [char]0x0020, [char]0x0432, [char]0x044b, [char]0x043f, [char]0x043e, [char]0x043b, [char]0x043d, [char]0x044f, [char]0x0435, [char]0x0442, [char]0x0020, [char]0x043f, [char]0x0440, [char]0x043e, [char]0x0432, [char]0x0435, [char]0x0440, [char]0x043a, [char]0x0443)
+    $utf8Jsonl = [pscustomobject]@{ type = 'item.completed'; item = [pscustomobject]@{ type = 'agent_message'; text = $utf8Activity } } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($jsonlFixture, $utf8Jsonl, [Text.UTF8Encoding]::new($false))
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Activity $utf8Activity 'UTF-8 JSONL activity preserves Cyrillic text'
+    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
     $monitorRows = @(Get-ActivityMonitorRows ([pscustomobject]@{ launches = @(
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 98; status = 'done'; pid = 1234; logPath = '' },
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 100; status = 'interrupted'; pid = 5432; logPath = '' }
     ) }))
-    Assert-Equal $monitorRows.Count 2 'The activity monitor renders every tracked launch'
+    Assert-Equal $monitorRows.Count 2 'The activity monitor hides completed launches'
     Assert-Equal $monitorRows[0].Repository 'example-org/example-repo' 'Activity rows include the repository'
     Assert-Equal $monitorRows[0].Issue 99 'Activity rows include the Issue number'
     Assert-Equal $monitorRows[0].Pid '4321' 'Activity rows include the tracked PID'
     Assert-Equal $monitorRows[1].Status 'interrupted' 'Activity rows preserve interrupted terminal status'
     Assert-True ($monitorRows[1].Activity -match 'manual recovery') 'Interrupted rows explain the recovery state'
+    $script:IsActivityMonitor = $true; $script:ActivityMonitorCompletedIssueKeys.Clear()
+    Add-ActivityMonitorCompletedIssue ([pscustomobject]@{ Repository = 'example-org/example-repo'; Number = 98 })
+    Add-ActivityMonitorCompletedIssue ([pscustomobject]@{ Repository = 'example-org/example-repo'; Number = 99 })
+    $completionSummary = @(Get-ActivityMonitorCompletionSummary)
+    Assert-Equal $completionSummary.Count 1 'Completion summary groups completed Issues by repository'
+    Assert-Equal $completionSummary[0].Count 2 'Completion summary counts completed Issues in the current session'
     $snapshotStatePath = Join-Path $temporaryRoot 'activity-monitor\launches.json'
     Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @(
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
@@ -389,8 +415,10 @@ try {
     $snapshotConfig = [pscustomobject]@{ Launch = [pscustomobject]@{ Enabled = $true; StatePath = $snapshotStatePath } }
     $snapshot = (& { Write-ActivityMonitorSnapshot -Config $snapshotConfig -Iteration ([pscustomobject]@{ PollIntervalSeconds = 60 }) } 6>&1 | Out-String)
     Assert-True ($snapshot -match 'live agent activity' -and $snapshot -match 'Latest activity UTC') 'Watch mode renders a current activity snapshot'
+    Assert-True ($snapshot -match 'Completed this session:' -and $snapshot -match 'example-org/example-repo: 2') 'Watch snapshot shows per-project completion counts for the current session'
     Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
     Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
+    $script:IsActivityMonitor = $false; $script:ActivityMonitorCompletedIssueKeys.Clear()
     [IO.File]::WriteAllText($jsonlFixture, '{"type":"item.completed","item":{"type":"agent_message","text":"Implementation complete. WATCHER_OUTCOME: done"}}' + "`n" + '{"type":"watcher-runner-exit","exitCode":0}')
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'done' 'Only an explicit done marker maps to done before the commit gate'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"completed`"}`n{`"type`":`"watcher-runner-exit`",`"exitCode`":0}")

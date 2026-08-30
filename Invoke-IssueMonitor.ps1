@@ -20,6 +20,7 @@ Import-Module -Name $modulePath -Force
 # existing line-oriented output.
 $script:IsActivityMonitor = [bool]$Watch
 $script:ActivityMonitorNotices = [System.Collections.Generic.List[string]]::new()
+$script:ActivityMonitorCompletedIssueKeys = [System.Collections.Generic.HashSet[string]]::new()
 
 function Protect-MonitorText {
     param([AllowNull()][string]$Text)
@@ -34,6 +35,43 @@ function Protect-MonitorText {
 function Add-ActivityMonitorNotice {
     param([Parameter(Mandatory)][string]$Message)
     if ($script:IsActivityMonitor) { [void]$script:ActivityMonitorNotices.Add((Protect-MonitorText $Message)) }
+}
+function Add-ActivityMonitorCompletedIssue {
+    param([Parameter(Mandatory)]$Issue)
+    if ($script:IsActivityMonitor) { [void]$script:ActivityMonitorCompletedIssueKeys.Add(('{0}#{1}' -f $Issue.Repository, $Issue.Number)) }
+}
+function Get-ActivityMonitorCompletionSummary {
+    $counts = @{}
+    foreach ($key in @($script:ActivityMonitorCompletedIssueKeys)) {
+        $separator = $key.LastIndexOf('#')
+        if ($separator -lt 1) { continue }
+        $repository = $key.Substring(0, $separator)
+        if ($counts.ContainsKey($repository)) { $counts[$repository]++ } else { $counts[$repository] = 1 }
+    }
+    return @($counts.GetEnumerator() | Sort-Object Name | ForEach-Object { [pscustomobject]@{ Repository = $_.Name; Count = [int]$_.Value } })
+}
+function Remove-ClosedIssueLaunches {
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][object[]]$Issues)
+    $closedIssues = @{}
+    foreach ($issue in $Issues) {
+        if ($null -ne $issue -and [string]$issue.State -eq 'closed') { $closedIssues[('{0}#{1}' -f $issue.Repository, $issue.Number)] = $issue }
+    }
+    if ($closedIssues.Count -eq 0) { return [pscustomobject]@{ State = $State; Changed = $false } }
+    $remaining = [System.Collections.Generic.List[object]]::new(); $changed = $false
+    foreach ($launch in @($State.launches)) {
+        if ($null -eq $launch) { continue }
+        $key = '{0}#{1}' -f $launch.repository, $launch.issueNumber
+        if (-not $closedIssues.ContainsKey($key)) { [void]$remaining.Add($launch); continue }
+        if ([string]$launch.status -eq 'running') {
+            Add-ActivityMonitorNotice "Closed Issue $key still has an active local process and remains tracked until it exits."
+            [void]$remaining.Add($launch); continue
+        }
+        Add-ActivityMonitorCompletedIssue $closedIssues[$key]
+        Add-ActivityMonitorNotice "Closed Issue $key was removed from tracked launch state."
+        $changed = $true
+    }
+    if ($changed) { $State.launches = @($remaining) }
+    return [pscustomobject]@{ State = $State; Changed = $changed }
 }
 function Write-MonitorMessage {
     param([Parameter(Mandatory)][string]$Message, [string]$Status = 'error')
@@ -74,7 +112,7 @@ function Get-LaunchJsonlStatus {
     param([Parameter(Mandatory)]$Launch)
     if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false } }
     $marker = $null; $detail = ''; $latestActivity = ''; $requestedHuman = $false; $runnerExitCode = $null
-    foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue)) {
+    foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         $text = [string]$line
         $agentText = ''; $hasUsableActivity = $true
@@ -124,6 +162,7 @@ function Get-ActivityMonitorRows {
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($launch in @($State.launches)) {
         if ($null -eq $launch) { continue }
+        if ([string]$launch.status -eq 'done') { continue }
         $jsonl = Get-LaunchJsonlStatus $launch
         $activity = if (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Detail)) { $jsonl.Detail } elseif (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Activity)) { $jsonl.Activity } elseif ([string]$launch.status -eq 'interrupted') { 'PID is no longer identity-verified; manual recovery is required.' } else { '-' }
         [void]$rows.Add([pscustomobject]@{
@@ -149,7 +188,13 @@ function Write-ActivityMonitorSnapshot {
     else {
         $state = Read-IssueLaunchState -Path $Config.Launch.StatePath
         $rows = @(Get-ActivityMonitorRows $state)
+        $completed = @(Get-ActivityMonitorCompletionSummary)
         if (-not [bool]$Config.Launch.Enabled) { Write-Host 'New launch processing is disabled; showing preserved tracked launch state.' }
+        if ($completed.Count -eq 0) { Write-Host 'Completed this session: none.' }
+        else {
+            Write-Host 'Completed this session:'
+            foreach ($entry in $completed) { Write-Host ('  {0}: {1}' -f (Get-DisplayText $entry.Repository 50), $entry.Count) }
+        }
         if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.' }
         else {
             Write-Host ('{0,-35} {1,-8} {2,-14} {3,-8} {4,-20} {5}' -f 'Repository', 'Issue', 'Status', 'PID', 'Latest activity UTC', 'Activity')
@@ -219,6 +264,9 @@ function Invoke-LaunchMonitoring {
     foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
         $issuesByKey[('{0}#{1}' -f $event.Issue.Repository, $event.Issue.Number)] = $event.Issue
     }
+    $closedLaunches = Remove-ClosedIssueLaunches -State $state -Issues @($issuesByKey.Values)
+    $state = $closedLaunches.State
+    $stateChanged = $stateChanged -or [bool]$closedLaunches.Changed
     foreach ($launch in @($state.launches)) {
         $keyIssue = [pscustomobject]@{ Repository = [string]$launch.repository; Number = [int]$launch.issueNumber }
         if ([string]$launch.status -ne 'running') {
@@ -247,7 +295,9 @@ function Invoke-LaunchMonitoring {
                 $commitCheck = Test-IssueLaunchHasNewCommit -LaunchMetadata $launch
                 if (-not $commitCheck.HasNewCommit) { $terminalStatus = 'needs-human'; $terminalDetail = $commitCheck.Message }
             }
-            Set-LaunchProperty $launch 'status' $terminalStatus; $stateChanged = $true; Write-LaunchEvent $terminalStatus $keyIssue $terminalDetail
+            Set-LaunchProperty $launch 'status' $terminalStatus; $stateChanged = $true
+            if ($terminalStatus -eq 'done') { Add-ActivityMonitorCompletedIssue $keyIssue }
+            Write-LaunchEvent $terminalStatus $keyIssue $terminalDetail
             if ($terminalStatus -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $terminalStatus $GitHubToken) { $stateChanged = $true } }
         }
     }
