@@ -117,14 +117,14 @@ function Get-LaunchJsonlStatus {
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         $text = [string]$line
-        $agentText = ''; $hasUsableActivity = $true
+        $agentText = ''; $hasUsableActivity = $false; $humanInterventionEvent = $false
         try {
             $json = $text | ConvertFrom-Json -ErrorAction Stop; $parts = @()
-            $hasUsableActivity = $false
             foreach ($name in @('type', 'event', 'status', 'message', 'error', 'output')) {
                 if ($null -ne $json.PSObject.Properties[$name]) {
                     $parts += [string]$json.$name
                     if ($name -in @('message', 'error', 'output') -and -not [string]::IsNullOrWhiteSpace([string]$json.$name)) { $hasUsableActivity = $true }
+                    if ($name -in @('type', 'event', 'status') -and [string]$json.$name -match '^(?i:needs[-_ ]?human|human[-_ ]?input|approval[-_ ]?required)$') { $humanInterventionEvent = $true }
                 }
             }
             if ($parts.Count -gt 0) { $text = $parts -join ' ' }
@@ -139,7 +139,12 @@ function Get-LaunchJsonlStatus {
                 $parsedExitCode = 0
                 if ([int]::TryParse([string]$json.exitCode, [ref]$parsedExitCode)) { $runnerExitCode = $parsedExitCode }
             }
-        } catch { }
+        } catch {
+            # A writer can leave its current final JSONL record incomplete.
+            # Do not use raw, unparsed bytes for state or activity; the next
+            # poll will process this record after it becomes valid JSON.
+            continue
+        }
         $safeText = Protect-MonitorText $text
         $safeAgentText = Protect-MonitorText $agentText
         $candidateActivity = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText }
@@ -147,7 +152,7 @@ function Get-LaunchJsonlStatus {
         if ($hasUsableActivity -and -not [string]::IsNullOrWhiteSpace($candidateActivity)) { $latestActivity = Get-DisplayText $candidateActivity 120 }
         $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(commit-request|needs-human|failed)\b')
         if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
-        if ($safeText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required' -or $safeAgentText -match '(?i)need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
+        if ($humanInterventionEvent -or $safeAgentText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required|need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
             $requestedHuman = $true; if ([string]::IsNullOrWhiteSpace($detail)) { $detail = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText } }
         }
     }
