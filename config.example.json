@@ -1,0 +1,9 @@
+{
+  "repositories": [
+    "example-org/example-repo"
+  ],
+  "pollIntervalSeconds": 60,
+  "watchedLabels": [
+    "status:ready"
+  ]
+}
