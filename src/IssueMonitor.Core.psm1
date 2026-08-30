@@ -1,6 +1,7 @@
 Set-StrictMode -Version Latest
 
 $script:IssueMonitorStateVersion = 2
+$script:IssueAgentRunnerEventVersion = 1
 $script:GitHubApiVersion = '2022-11-28'
 $script:GitHubUserAgent = 'local-issue-agent-monitor-v0'
 $script:GitHubCredentialTarget = 'local-issue-agent-monitor/github-issues'
@@ -688,15 +689,56 @@ function ConvertTo-IssueLaunchCommandLineArgument {
     return '"' + $escaped + '"'
 }
 
-function Start-IssueLaunchProcess {
+function New-CodexIssueAgentRunner {
     [CmdletBinding()]
     param(
+        [string]$Command = 'codex'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { throw 'The Codex runner command cannot be empty.' }
+    return [pscustomobject]@{
+        Name = 'codex'
+        EventVersion = $script:IssueAgentRunnerEventVersion
+        Command = $Command
+        CommandDescription = ($Command + ' exec --sandbox workspace-write --json -- -')
+        Discover = {
+            param($Runner)
+            $resolved = Get-Command -Name ([string]$Runner.Command) -ErrorAction SilentlyContinue
+            if ($null -eq $resolved) { throw "Configured Codex command '$($Runner.Command)' was not found. No worktree was created." }
+            return $resolved
+        }
+        Start = {
+            param($Runner, $Prompt, $LogPath, $StateDirectory, $WorkingDirectory)
+            Start-CodexIssueAgentRunnerProcess -Command ([string]$Runner.Command) -Prompt $Prompt -LogPath $LogPath -StateDirectory $StateDirectory -WorkingDirectory $WorkingDirectory
+        }
+    }
+}
+
+function Test-IssueAgentRunner {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Runner)
+    if ([string]::IsNullOrWhiteSpace([string]$Runner.Name)) { throw 'Agent runner must provide a name.' }
+    if ([int]$Runner.EventVersion -ne $script:IssueAgentRunnerEventVersion) { throw "Agent runner '$($Runner.Name)' must emit normalized event version $script:IssueAgentRunnerEventVersion." }
+    if ($null -eq $Runner.PSObject.Properties['Discover'] -or $Runner.Discover -isnot [scriptblock]) { throw "Agent runner '$($Runner.Name)' must provide command discovery." }
+    if ($null -eq $Runner.PSObject.Properties['Start'] -or $Runner.Start -isnot [scriptblock]) { throw "Agent runner '$($Runner.Name)' must provide process launch." }
+    return $true
+}
+
+function Find-IssueAgentRunnerCommand {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Runner)
+    Test-IssueAgentRunner -Runner $Runner | Out-Null
+    return (& $Runner.Discover $Runner)
+}
+
+function Start-IssueAgentRunner {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Runner,
         [Parameter(Mandatory)][string]$Prompt,
         [Parameter(Mandatory)][string]$LogPath,
         [Parameter(Mandatory)][string]$StateDirectory,
-        [Parameter(Mandatory)][string]$WorkingDirectory,
-        [string]$CodexCommand = 'codex',
-        [scriptblock]$StartProcessScript
+        [Parameter(Mandatory)][string]$WorkingDirectory
     )
     $stateDirectory = [IO.Path]::GetFullPath($StateDirectory)
     $logPath = [IO.Path]::GetFullPath($LogPath)
@@ -707,21 +749,31 @@ function Start-IssueLaunchProcess {
     if (-not (Test-Path -LiteralPath $workingDirectory -PathType Container)) {
         throw "Agent working directory '$workingDirectory' does not exist."
     }
-    if ($null -ne $StartProcessScript) {
-        return (& $StartProcessScript -Prompt $Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $workingDirectory -CodexCommand $CodexCommand)
-    }
+    Test-IssueAgentRunner -Runner $Runner | Out-Null
+    return (& $Runner.Start $Runner $Prompt $logPath $stateDirectory $workingDirectory)
+}
+
+function Start-CodexIssueAgentRunnerProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$StateDirectory,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
     if (-not (Test-Path -LiteralPath $stateDirectory -PathType Container)) { New-Item -ItemType Directory -Path $stateDirectory -Force -ErrorAction Stop | Out-Null }
     $runnerPath = Join-Path -Path $stateDirectory -ChildPath ('runner-' + [Guid]::NewGuid().ToString('N') + '.ps1')
     $promptBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Prompt))
     $logBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($logPath))
     $workingDirectoryBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($workingDirectory))
-    $codexBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($CodexCommand))
+    $commandBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Command))
     $runner = @"
 `$ErrorActionPreference = 'Continue'
 `$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$promptBase64'))
 `$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
 `$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
-`$codex = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$codexBase64'))
+`$command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$commandBase64'))
 `$utf8NoBom = [Text.UTF8Encoding]::new(`$false)
 [Console]::OutputEncoding = `$utf8NoBom
 `$OutputEncoding = `$utf8NoBom
@@ -736,9 +788,46 @@ function Protect-LaunchLogLine {
     return `$safe
 }
 Set-Location -LiteralPath `$workingDirectory
-& `$codex exec --sandbox workspace-write --json -- `$prompt 2>`$null | ForEach-Object { Protect-LaunchLogLine `$_.ToString() } | Out-File -LiteralPath `$logPath -Append -Encoding utf8
+function Write-NormalizedAgentEvent {
+    param([Parameter(Mandatory)][string]`$Event, [string]`$Message = '', [string]`$Outcome = '', [string]`$HumanRequest = '', [int]`$ExitCode = -2147483648)
+    `$record = [ordered]@{ version = $script:IssueAgentRunnerEventVersion; type = 'watcher-agent-event'; event = `$Event }
+    if (-not [string]::IsNullOrWhiteSpace(`$Message)) { `$record.message = Protect-LaunchLogLine `$Message }
+    if (-not [string]::IsNullOrWhiteSpace(`$Outcome)) { `$record.outcome = `$Outcome }
+    if (-not [string]::IsNullOrWhiteSpace(`$HumanRequest)) { `$record.humanRequest = Protect-LaunchLogLine `$HumanRequest }
+    if (`$ExitCode -ne -2147483648) { `$record.exitCode = `$ExitCode }
+    (`$record | ConvertTo-Json -Compress) | Out-File -LiteralPath `$logPath -Append -Encoding utf8
+}
+function Get-CodexAgentMessage {
+    param([Parameter(Mandatory)][string]`$Line)
+    try {
+        `$json = `$Line | ConvertFrom-Json -ErrorAction Stop
+        `$item = if (`$null -ne `$json.PSObject.Properties['item']) { `$json.item } else { `$null }
+        if (`$null -ne `$item -and [string]`$item.type -eq 'agent_message') {
+            foreach (`$name in @('text', 'message', 'output')) { if (`$null -ne `$item.PSObject.Properties[`$name]) { return [string]`$item.`$name } }
+        }
+        if (`$null -ne `$json.PSObject.Properties['type'] -and [string]`$json.type -eq 'agent_message') {
+            foreach (`$name in @('text', 'message', 'output')) { if (`$null -ne `$json.PSObject.Properties[`$name]) { return [string]`$json.`$name } }
+        }
+    } catch { }
+    return ''
+}
+`$prompt | & `$command exec --sandbox workspace-write --json -- - 2>`$null | ForEach-Object {
+    `$raw = `$_.ToString()
+    `$agentText = Get-CodexAgentMessage `$raw
+    if ([string]::IsNullOrWhiteSpace(`$agentText)) { Write-NormalizedAgentEvent -Event 'activity' -Message `$raw }
+    else {
+        Write-NormalizedAgentEvent -Event 'activity' -Message `$agentText
+        `$outcomes = [regex]::Matches(`$agentText, '(?i)WATCHER_OUTCOME\s*:\s*(commit-request|needs-human|failed)\b')
+        if (`$outcomes.Count -gt 0) {
+            `$outcome = `$outcomes[`$outcomes.Count - 1].Groups[1].Value.ToLowerInvariant()
+            `$requests = [regex]::Matches(`$agentText, '(?im)^\s*WATCHER_HUMAN_REQUEST\s*:\s*(?<request>\S[^\r\n]*)\s*`$')
+            `$request = if (`$requests.Count -gt 0) { `$requests[`$requests.Count - 1].Groups['request'].Value } else { '' }
+            Write-NormalizedAgentEvent -Event 'outcome' -Message `$agentText -Outcome `$outcome -HumanRequest `$request
+        }
+    }
+}
 `$exitCode = `$LASTEXITCODE
-('{"type":"watcher-runner-exit","exitCode":' + `$exitCode + '}') | Out-File -LiteralPath `$logPath -Append -Encoding utf8
+Write-NormalizedAgentEvent -Event 'exit' -ExitCode `$exitCode
 exit `$exitCode
 "@
     [IO.File]::WriteAllText($runnerPath, $runner, [Text.UTF8Encoding]::new($false))
@@ -754,6 +843,28 @@ exit `$exitCode
     if ($null -eq $process -or $process.Id -lt 1) { throw 'Could not start the separate PowerShell Codex process.' }
     $processStartedAt = try { [DateTimeOffset]$process.StartTime.ToUniversalTime() } catch { [DateTimeOffset]::UtcNow }
     return [pscustomobject]@{ Id = [int]$process.Id; RunnerPath = $runnerPath; LogPath = $logPath; WorkingDirectory = $workingDirectory; StartedAt = $processStartedAt }
+}
+
+function Start-IssueLaunchProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$StateDirectory,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [string]$CodexCommand = 'codex',
+        [scriptblock]$StartProcessScript
+    )
+    # Compatibility wrapper for callers of the original launch seam. New
+    # lifecycle code uses the runner contract directly.
+    $runner = New-CodexIssueAgentRunner -Command $CodexCommand
+    if ($null -ne $StartProcessScript) {
+        $runner.Start = {
+            param($Runner, $RunnerPrompt, $RunnerLogPath, $RunnerStateDirectory, $RunnerWorkingDirectory)
+            & $StartProcessScript -Prompt $RunnerPrompt -LogPath $RunnerLogPath -StateDirectory $RunnerStateDirectory -WorkingDirectory $RunnerWorkingDirectory -CodexCommand ([string]$Runner.Command)
+        }
+    }
+    return (Start-IssueAgentRunner -Runner $runner -Prompt $Prompt -LogPath $LogPath -StateDirectory $StateDirectory -WorkingDirectory $WorkingDirectory)
 }
 
 function Stop-IssueLaunchProcess {
@@ -1339,5 +1450,5 @@ Export-ModuleMember -Function @(
     'Test-IssueLaunchWorktreeSafety', 'Test-IssueLaunchBranchSafety', 'Test-IssueLaunchRepositorySafety', 'New-IssueLaunchWorktree',
     'New-IssueLaunchPrompt', 'New-IssueLaunchPlan',
     'Test-IssueLaunchStatePathSafety', 'New-IssueLaunchMetadata', 'Test-IssueLaunchHasNewCommit', 'Test-IssueLaunchCommitRequest', 'Invoke-IssueLaunchCommitRequest', 'Read-IssueLaunchState', 'Save-IssueLaunchState',
-    'Find-IssueLaunchMetadata', 'Reconcile-IssueLaunchState', 'Start-IssueLaunchProcess', 'Stop-IssueLaunchProcess', 'Request-IssueLaunchAgentLabel'
+    'Find-IssueLaunchMetadata', 'Reconcile-IssueLaunchState', 'New-CodexIssueAgentRunner', 'Test-IssueAgentRunner', 'Find-IssueAgentRunnerCommand', 'Start-IssueAgentRunner', 'Start-IssueLaunchProcess', 'Stop-IssueLaunchProcess', 'Request-IssueLaunchAgentLabel'
 )

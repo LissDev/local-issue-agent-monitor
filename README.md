@@ -60,9 +60,26 @@ write**. Read access lists Issues; write access changes only the monitor's
 Credential belongs to the current Windows user; another Windows user must
 create their own credential.
 
-The Codex CLI must already be signed in with the user's ChatGPT subscription.
+The built-in Codex runner must already be signed in with the user's ChatGPT subscription.
 This monitor does not use an OpenAI API key, API billing, or a copied desktop
 session.
+
+## Runner contract
+
+The monitor lifecycle is CLI-neutral. It asks a runner to discover its command,
+launch it in the isolated worktree, deliver the trusted prompt, and append
+normalized JSONL records. The built-in runner remains Codex-only for now and
+uses the existing `launch.codexCommand` setting; choosing a different runner is
+not yet configurable.
+
+Each record has `version: 1`, `type: "watcher-agent-event"`, and one of these
+event values: `activity` (a redacted `message`), `outcome` (a terminal
+`outcome`, optional `message`, and optional `humanRequest`), or `exit` (an
+`exitCode`). Launch-state processing and `-Follow` consume this normalized
+shape rather than Codex event fields. The Codex runner invokes
+`codex exec --sandbox workspace-write --json` and sends the exact prompt over
+standard input, so untrusted Issue content is never assembled into shell
+syntax or a child-process command line.
 
 ## Monitor modes
 
@@ -108,8 +125,8 @@ Review a no-change plan before enabling or starting anything:
 
 `-WhatIf` may read the configured GitHub Issues and local Git state to calculate
 the branch and worktree plan, but it never changes GitHub, creates a worktree,
-writes launch metadata, or starts/stops a process.  Its output includes the
-computed branch, worktree path, and `codex exec --json` command shape.
+writes launch metadata, or starts/stops a process. Its output includes the
+computed branch, worktree path, and built-in runner command shape.
 
 To stop one concrete tracked launch without deleting anything:
 
@@ -124,9 +141,9 @@ print the target without stopping it.
 ## Statuses and recovery
 
 The console shows normal Issue rows plus launch statuses: `queued`, `preflight`,
-`running`, `needs-human`, `done`, `failed`, and `interrupted`.  JSONL emitted by
-Codex is written to the external state directory and summarized without printing
-credentials.  A process that has disappeared becomes `interrupted`; it is never
+`running`, `needs-human`, `done`, `failed`, and `interrupted`. Normalized JSONL
+written by the runner is stored in the external state directory and summarized
+without printing credentials. A process that has disappeared becomes `interrupted`; it is never
 restarted automatically.  Inspect the preserved worktree and log, then decide
 whether to continue manually or create a new Issue/launch request.
 
