@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $PSScriptRoot 'config.json' }
 $modulePath = Join-Path $PSScriptRoot 'src\IssueMonitor.Core.psm1'
 if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) { throw "The core module was not found at '$modulePath'." }
-Import-Module -Name $modulePath -Force
+Import-Module -Name $modulePath -Force -DisableNameChecking
 
 # Watch mode collects the normal lifecycle messages during a poll, then renders
 # them as part of one refreshed snapshot.  One-off and Stop modes keep their
@@ -83,10 +83,14 @@ function Write-MonitorMessage {
 }
 function Get-DisplayText {
     param([AllowNull()][string]$Text, [int]$MaximumLength = 60)
+    # Keep the truncation marker ASCII-only so Windows PowerShell 5.1 can
+    # parse this BOM-less source consistently on every system code page.
+    $truncationSuffix = '...'
     $safe = Protect-MonitorText $Text
     if ([string]::IsNullOrWhiteSpace($safe)) { return '-' }
     if ($safe.Length -le $MaximumLength) { return $safe }
-    return $safe.Substring(0, $MaximumLength - 1) + '…'
+    if ($MaximumLength -le $truncationSuffix.Length) { return $safe.Substring(0, $MaximumLength) }
+    return $safe.Substring(0, $MaximumLength - $truncationSuffix.Length) + $truncationSuffix
 }
 function Write-IssueMonitorEvent {
     param([Parameter(Mandatory)]$Event)

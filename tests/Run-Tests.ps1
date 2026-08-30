@@ -5,7 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Path $PSScriptRoot -Parent
-Import-Module (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Force
+Import-Module (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Force -DisableNameChecking
 
 $script:assertions = 0
 function Assert-Equal {
@@ -627,6 +627,10 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True (-not $cliIteration.Succeeded) 'CLI stops before polling when the credential is missing'
     Assert-True (-not (Test-Path -LiteralPath (Split-Path -Path $cliStatePath -Parent))) 'CLI WhatIf with disabled launch creates no launch-state directory'
     $jsonlFixture = Join-Path $temporaryRoot 'render.jsonl'
+    $monitorSource = Get-Content -LiteralPath (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -Raw
+    $monitorSourceBytes = [IO.File]::ReadAllBytes((Join-Path $projectRoot 'Invoke-IssueMonitor.ps1'))
+    Assert-True ($monitorSource -match 'Import-Module -Name \$modulePath -Force -DisableNameChecking') 'Monitor startup suppresses the expected non-approved-verb module warning'
+    Assert-True (@($monitorSourceBytes | Where-Object { $_ -gt 0x7f }).Count -eq 0) 'Monitor source remains ASCII-compatible with Windows PowerShell 5.1 without a BOM'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
     $rendered = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $rendered.Status 'running' 'A non-agent needs-human event does not change launch status'
@@ -636,6 +640,13 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $utf8Jsonl = [pscustomobject]@{ version = 1; type = 'watcher-agent-event'; event = 'activity'; message = $utf8Activity } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($jsonlFixture, $utf8Jsonl, [Text.UTF8Encoding]::new($false))
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Activity $utf8Activity 'UTF-8 JSONL activity preserves Cyrillic text'
+    $longUtf8Activity = ($utf8Activity + ' ') * 8
+    $longUtf8Jsonl = [pscustomobject]@{ version = 1; type = 'watcher-agent-event'; event = 'activity'; message = $longUtf8Activity } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($jsonlFixture, $longUtf8Jsonl, [Text.UTF8Encoding]::new($false))
+    $truncatedUtf8Activity = (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Activity
+    Assert-Equal $truncatedUtf8Activity ($longUtf8Activity.Substring(0, 117) + '...') 'Long UTF-8 JSONL activity is truncated with a deterministic ASCII suffix'
+    $mojibakeSuffix = -join @([char]0x0432, [char]0x0402, [char]0x00A6)
+    Assert-True ($truncatedUtf8Activity -notmatch [regex]::Escape($mojibakeSuffix)) 'Truncated activity never displays the mojibake ellipsis suffix'
     [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"Initial parsed activity."}' + "`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::AppendAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"failed","message":"Partial command: C:\\agent\\run.exe"')
     $partialJsonlStatus = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
