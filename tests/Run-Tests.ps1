@@ -368,6 +368,64 @@ try {
     }
     [IO.File]::WriteAllText($cliConfigPath, ($cliConfig | ConvertTo-Json -Depth 5))
     . (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $cliConfigPath -WhatIf
+
+    # Follow is a strictly local reader: a fresh, identity-verified heartbeat
+    # exposes watcher metadata and launch/log activity without calling GitHub or
+    # changing launch state.  Its first read tails existing JSONL rather than
+    # replaying it, then renders only appended records.
+    $followConfigPath = Join-Path $temporaryRoot 'follow.json'
+    $followStatePath = Join-Path $temporaryRoot 'follow-state\launches.json'
+    $followConfig = [pscustomobject]@{
+        Repositories = $cliConfig.repositories; WatchedLabels = $cliConfig.watchedLabels; PollIntervalSeconds = $cliConfig.pollIntervalSeconds
+        Launch = [pscustomobject]@{ Enabled = $false; StatePath = $followStatePath }
+    }
+    $followFileConfig = $cliConfig | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $followFileConfig.launch.statePath = $followStatePath
+    [IO.File]::WriteAllText($followConfigPath, ($followFileConfig | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+    $heartbeatPath = Get-WatcherHeartbeatPath $followConfig
+    New-Item -ItemType Directory -Path (Split-Path -Path $heartbeatPath -Parent) -Force | Out-Null
+    $testProcess = Get-Process -Id $PID
+    Write-WatcherHeartbeat -Config $followConfig -ConfigFilePath $followConfigPath -InstanceId 'test-watcher'
+    $heartbeat = Get-Content -LiteralPath $heartbeatPath -Raw | ConvertFrom-Json
+    $activeHeartbeat = Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds 60 -ProcessLookupScript { param($ProcessId) [pscustomobject]@{ StartTime = $testProcess.StartTime } }
+    Assert-True $activeHeartbeat.Active 'A fresh heartbeat with the matching process identity is active'
+    $followLogPath = Join-Path $temporaryRoot 'follow.jsonl'
+    [IO.File]::WriteAllText($followLogPath, '{"type":"agent_message","message":"existing event"}' + "`n")
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 88; status = 'running'; pid = 123; logPath = $followLogPath }) }) -Path $followStatePath
+    $followStateBefore = Get-Content -LiteralPath $followStatePath -Raw
+    $followCursors = @{}
+    $initialFollowEvents = @(Get-FollowLogEvents -State (Read-IssueLaunchState -Path $followStatePath) -Cursors $followCursors -Initialize)
+    Assert-Equal $initialFollowEvents.Count 0 'Follow does not replay JSONL that existed before observation began'
+    [IO.File]::AppendAllText($followLogPath, '{"type":"agent_message","message":"Authorization: Bearer github_pat_secret_value"}' + "`n")
+    $newFollowEvents = @(Get-FollowLogEvents -State (Read-IssueLaunchState -Path $followStatePath) -Cursors $followCursors)
+    Assert-Equal $newFollowEvents.Count 1 'Follow returns a newly appended JSONL record'
+    Assert-True ($newFollowEvents[0].Text -notmatch 'github_pat_secret_value') 'Follow redacts JSONL secrets before display'
+    Assert-Equal (Get-Content -LiteralPath $followStatePath -Raw) $followStateBefore 'Follow reads launch state without changing it'
+    $followSnapshot = (& { Write-FollowSnapshot -Config $followConfig -HeartbeatStatus $activeHeartbeat } 6>&1 | Out-String)
+    Assert-True ($followSnapshot -match 'follow \(read-only\)' -and $followSnapshot -match 'Watcher PID:' -and $followSnapshot -match 'example-org/example-repo') 'Follow displays watcher metadata and tracked launch state'
+    $staleHeartbeat = $heartbeat | Select-Object *
+    $staleHeartbeat.heartbeatAt = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToString('o')
+    [IO.File]::WriteAllText($heartbeatPath, ($staleHeartbeat | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    Assert-True (-not (Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds 60 -ProcessLookupScript { param($ProcessId) [pscustomobject]@{ StartTime = $testProcess.StartTime } }).Active) 'A stale heartbeat is not treated as an active watcher'
+    $reusedPidHeartbeat = $heartbeat | Select-Object *
+    $reusedPidHeartbeat.processStartedAt = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToString('o')
+    [IO.File]::WriteAllText($heartbeatPath, ($reusedPidHeartbeat | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    Assert-True (-not (Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds 60 -ProcessLookupScript { param($ProcessId) [pscustomobject]@{ StartTime = $testProcess.StartTime } }).Active) 'A reused PID with a different start time is not treated as an active watcher'
+    $defaultFollowOutput = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $followConfigPath 2>&1 | Out-String)
+    Assert-True ($defaultFollowOutput -match 'Follow: there is no active watcher') 'Running the CLI without a mode defaults to Follow instead of polling'
+    $watcherMutex = Enter-WatcherInstance $followConfig
+    try {
+        $secondWatchOutput = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $followConfigPath -Watch 2>&1 | Out-String)
+        Assert-True ($secondWatchOutput -match 'another watcher already owns') 'A second Watch for the same configuration exits before polling'
+        $onceWhileStartingOutput = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $followConfigPath -Once 2>&1 | Out-String)
+        Assert-True ($onceWhileStartingOutput -match 'Use \.\\Invoke-IssueMonitor\.ps1 -Follow instead') 'Once also declines while a watcher owns the mutex before publishing a heartbeat'
+    } finally {
+        $watcherMutex.ReleaseMutex(); $watcherMutex.Dispose()
+    }
+    [IO.File]::WriteAllText($heartbeatPath, ($heartbeat | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    $onceWhileWatchedOutput = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $followConfigPath -Once 2>&1 | Out-String)
+    Assert-True ($onceWhileWatchedOutput -match 'Use \.\\Invoke-IssueMonitor\.ps1 -Follow instead') 'Once declines safely when an active watcher owns the configuration'
+
     $script:IsActivityMonitor = $true; $script:ActivityMonitorCompletedIssueKeys.Clear()
     $closedTrackedIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 81 -State closed)
     $closedLaunchState = [pscustomobject]@{ launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 81; status = 'needs-human'; pid = 999 }) }

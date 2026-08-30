@@ -64,22 +64,44 @@ session.
 
 ## Monitor modes
 
-One poll is the default:
+Observation is the default and is read-only:
 
 ```powershell
-.\Invoke-IssueMonitor.ps1 -Once
+.\Invoke-IssueMonitor.ps1
+# equivalent to: .\Invoke-IssueMonitor.ps1 -Follow
 ```
 
-Watch continuously:
+`-Follow` requires an already active watcher for the same configuration. It
+shows the watcher's PID, last heartbeat, configuration, tracked launch state,
+and only JSONL events appended after Follow started. It never polls GitHub,
+creates a worktree, changes launch state or Issue labels, or starts/stops a
+process. If the heartbeat is absent, stale, or belongs to a different process,
+Follow reports that there is nothing to observe and exits; it never starts a
+watcher automatically.
+
+Continuous polling is explicit:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-IssueMonitor.ps1 -Watch
 ```
 
+`-Watch` publishes an identity-verified heartbeat next to `launch.statePath`.
+Only one Watch instance can own a configuration at a time; a second invocation
+exits before polling and suggests `-Follow`.
+
+Run one explicit poll only when no watcher is active:
+
+```powershell
+.\Invoke-IssueMonitor.ps1 -Once
+```
+
+When an active watcher owns the configuration, `-Once` exits without polling
+or changing anything and suggests `-Follow` instead.
+
 Review a no-change plan before enabling or starting anything:
 
 ```powershell
-.\Invoke-IssueMonitor.ps1 -ConfigPath C:\secure\issue-monitor.json -WhatIf
+.\Invoke-IssueMonitor.ps1 -ConfigPath C:\secure\issue-monitor.json -Once -WhatIf
 ```
 
 `-WhatIf` may read the configured GitHub Issues and local Git state to calculate

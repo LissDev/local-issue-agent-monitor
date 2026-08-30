@@ -1,11 +1,12 @@
-[CmdletBinding(DefaultParameterSetName = 'Once')]
+[CmdletBinding(DefaultParameterSetName = 'Follow')]
 param(
     [string]$ConfigPath,
     [Parameter(ParameterSetName = 'Once')][switch]$Once,
     [Parameter(Mandatory, ParameterSetName = 'Watch')][switch]$Watch,
+    [Parameter(ParameterSetName = 'Follow')][switch]$Follow,
     [Parameter(Mandatory, ParameterSetName = 'Stop')][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$')][string]$StopIssue,
     # Plan only: does not alter GitHub, Git, launch state, or child processes.
-    [switch]$WhatIf
+    [Parameter(ParameterSetName = 'Once')][Parameter(ParameterSetName = 'Watch')][Parameter(ParameterSetName = 'Stop')][switch]$WhatIf
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +22,7 @@ Import-Module -Name $modulePath -Force
 $script:IsActivityMonitor = [bool]$Watch
 $script:ActivityMonitorNotices = [System.Collections.Generic.List[string]]::new()
 $script:ActivityMonitorCompletedIssueKeys = [System.Collections.Generic.HashSet[string]]::new()
+$script:WatcherHeartbeatVersion = 1
 
 function Protect-MonitorText {
     param([AllowNull()][string]$Text)
@@ -211,6 +213,164 @@ function Write-ActivityMonitorSnapshot {
     }
 }
 
+function Get-WatcherHeartbeatPath {
+    param([Parameter(Mandatory)]$Config)
+    return ([IO.Path]::GetFullPath([string]$Config.Launch.StatePath) + '.watcher-heartbeat.json')
+}
+function Get-WatcherConfigurationKey {
+    param([Parameter(Mandatory)]$Config)
+    $identity = [IO.Path]::GetFullPath([string]$Config.Launch.StatePath).ToLowerInvariant()
+    $bytes = [Text.Encoding]::UTF8.GetBytes($identity)
+    $hash = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    return (-join ($hash | ForEach-Object { $_.ToString('x2') }))
+}
+function Get-WatcherHeartbeatMaximumAgeSeconds {
+    param([Parameter(Mandatory)]$Config)
+    return [Math]::Max(30, ([int]$Config.PollIntervalSeconds * 2) + 15)
+}
+function Test-WatcherProcessIdentity {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ProcessStartedAt,
+        [scriptblock]$ProcessLookupScript
+    )
+    try {
+        $process = if ($null -ne $ProcessLookupScript) { & $ProcessLookupScript -ProcessId $ProcessId } else { Get-Process -Id $ProcessId -ErrorAction SilentlyContinue }
+        if ($null -eq $process) { return $false }
+        $expected = [DateTimeOffset]::Parse($ProcessStartedAt).ToUniversalTime()
+        $actual = [DateTimeOffset]$process.StartTime.ToUniversalTime()
+        return [Math]::Abs(($actual - $expected).TotalSeconds) -lt 1
+    } catch { return $false }
+}
+function Get-WatcherHeartbeatStatus {
+    param(
+        [Parameter(Mandatory)][string]$HeartbeatPath,
+        [Parameter(Mandatory)][int]$MaximumAgeSeconds,
+        [datetimeoffset]$Now = [DateTimeOffset]::UtcNow,
+        [scriptblock]$ProcessLookupScript
+    )
+    $missing = [pscustomobject]@{ Active = $false; Reason = 'No watcher heartbeat was found.'; Heartbeat = $null; AgeSeconds = $null }
+    if (-not (Test-Path -LiteralPath $HeartbeatPath -PathType Leaf)) { return $missing }
+    try { $heartbeat = Get-Content -LiteralPath $HeartbeatPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { return [pscustomobject]@{ Active = $false; Reason = 'The watcher heartbeat cannot be read.'; Heartbeat = $null; AgeSeconds = $null } }
+    $heartbeatProcessId = 0
+    if ($null -eq $heartbeat -or -not [int]::TryParse([string]$heartbeat.pid, [ref]$heartbeatProcessId) -or $heartbeatProcessId -lt 1 -or [string]::IsNullOrWhiteSpace([string]$heartbeat.processStartedAt)) {
+        return [pscustomobject]@{ Active = $false; Reason = 'The watcher heartbeat is incomplete.'; Heartbeat = $heartbeat; AgeSeconds = $null }
+    }
+    try { $heartbeatAt = [DateTimeOffset]::Parse([string]$heartbeat.heartbeatAt).ToUniversalTime() }
+    catch { return [pscustomobject]@{ Active = $false; Reason = 'The watcher heartbeat has no valid timestamp.'; Heartbeat = $heartbeat; AgeSeconds = $null } }
+    $ageSeconds = ($Now.ToUniversalTime() - $heartbeatAt).TotalSeconds
+    if ($ageSeconds -lt -5 -or $ageSeconds -gt $MaximumAgeSeconds) {
+        return [pscustomobject]@{ Active = $false; Reason = ('The watcher heartbeat is stale ({0:N0}s old).' -f [Math]::Max(0, $ageSeconds)); Heartbeat = $heartbeat; AgeSeconds = $ageSeconds }
+    }
+    if (-not (Test-WatcherProcessIdentity -ProcessId $heartbeatProcessId -ProcessStartedAt ([string]$heartbeat.processStartedAt) -ProcessLookupScript $ProcessLookupScript)) {
+        return [pscustomobject]@{ Active = $false; Reason = 'The watcher PID is not alive with the recorded process identity.'; Heartbeat = $heartbeat; AgeSeconds = $ageSeconds }
+    }
+    return [pscustomobject]@{ Active = $true; Reason = ''; Heartbeat = $heartbeat; AgeSeconds = $ageSeconds }
+}
+function Write-WatcherHeartbeat {
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$ConfigFilePath, [Parameter(Mandatory)][string]$InstanceId)
+    $path = Get-WatcherHeartbeatPath $Config
+    $directory = Split-Path -Path $path -Parent
+    $process = Get-Process -Id $PID -ErrorAction Stop
+    $payload = [pscustomobject]@{
+        version = $script:WatcherHeartbeatVersion; pid = $PID
+        processStartedAt = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToString('o')
+        heartbeatAt = [DateTimeOffset]::UtcNow.ToString('o'); instanceId = $InstanceId
+        config = [pscustomobject]@{
+            path = [IO.Path]::GetFullPath($ConfigFilePath); launchStatePath = [IO.Path]::GetFullPath([string]$Config.Launch.StatePath)
+            repositories = @($Config.Repositories); pollIntervalSeconds = [int]$Config.PollIntervalSeconds; watchedLabels = @($Config.WatchedLabels)
+        }
+    }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null }
+    $temporaryPath = Join-Path $directory ('.watcher-heartbeat-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    try {
+        [IO.File]::WriteAllText($temporaryPath, ($payload | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporaryPath -Destination $path -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+function Enter-WatcherInstance {
+    param([Parameter(Mandatory)]$Config)
+    $mutexName = 'Local\local-issue-agent-monitor-' + (Get-WatcherConfigurationKey $Config)
+    $mutex = [Threading.Mutex]::new($false, $mutexName)
+    $acquired = $false
+    try { $acquired = $mutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $acquired = $true }
+    if (-not $acquired) { $mutex.Dispose(); return $null }
+    return $mutex
+}
+function Test-WatcherInstanceOwned {
+    param([Parameter(Mandatory)]$Config)
+    $mutex = Enter-WatcherInstance $Config
+    if ($null -eq $mutex) { return $true }
+    try { return $false }
+    finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
+}
+function Convert-JsonlLineToFollowText {
+    param([Parameter(Mandatory)][string]$Line)
+    $text = $Line
+    try {
+        $json = $Line | ConvertFrom-Json -ErrorAction Stop
+        $item = if ($null -ne $json.PSObject.Properties['item']) { $json.item } else { $null }
+        if ($null -ne $item -and [string]$item.type -eq 'agent_message' -and $null -ne $item.PSObject.Properties['text']) { $text = [string]$item.text }
+        elseif ($null -ne $json.PSObject.Properties['message']) { $text = [string]$json.message }
+        elseif ($null -ne $json.PSObject.Properties['output']) { $text = [string]$json.output }
+        elseif ($null -ne $json.PSObject.Properties['error']) { $text = [string]$json.error }
+        elseif ($null -ne $json.PSObject.Properties['type']) { $text = [string]$json.type }
+    } catch { }
+    return (Get-DisplayText (Protect-MonitorText $text) 180)
+}
+function Get-FollowLogEvents {
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][hashtable]$Cursors, [switch]$Initialize)
+    $events = [System.Collections.Generic.List[object]]::new()
+    foreach ($launch in @($State.launches)) {
+        if ($null -eq $launch -or [string]::IsNullOrWhiteSpace([string]$launch.logPath) -or -not (Test-Path -LiteralPath $launch.logPath -PathType Leaf)) { continue }
+        $lines = @(Get-Content -LiteralPath $launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)
+        $key = [string]$launch.logPath; $offset = if ($Cursors.ContainsKey($key)) { [int]$Cursors[$key] } else { 0 }
+        if ($Initialize -and -not $Cursors.ContainsKey($key)) { $Cursors[$key] = $lines.Count; continue }
+        if ($lines.Count -lt $offset) { $offset = 0 }
+        for ($index = $offset; $index -lt $lines.Count; $index++) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$lines[$index])) {
+                [void]$events.Add([pscustomobject]@{ Repository = [string]$launch.repository; Issue = [int]$launch.issueNumber; Text = (Convert-JsonlLineToFollowText ([string]$lines[$index])) })
+            }
+        }
+        $Cursors[$key] = $lines.Count
+    }
+    return @($events)
+}
+function Write-FollowSnapshot {
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$HeartbeatStatus)
+    $heartbeat = $HeartbeatStatus.Heartbeat
+    Write-Host 'local-issue-agent-monitor v1 | follow (read-only)'
+    Write-Host ('Watcher PID: {0} | Last heartbeat UTC: {1} | Config: {2}' -f $heartbeat.pid, $heartbeat.heartbeatAt, $heartbeat.config.launchStatePath)
+    $rows = @((Read-IssueLaunchState -Path $Config.Launch.StatePath).launches | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.'; return }
+    Write-Host ('{0,-35} {1,-8} {2,-14} {3}' -f 'Repository', 'Issue', 'Status', 'PID')
+    foreach ($row in $rows) {
+        Write-Host ('{0,-35} #{1,-7} {2,-14} {3}' -f (Get-DisplayText ([string]$row.repository) 35), $row.issueNumber, (Get-DisplayText ([string]$row.status) 14), $row.pid)
+    }
+}
+function Invoke-FollowMode {
+    param([Parameter(Mandatory)]$Config)
+    $heartbeatPath = Get-WatcherHeartbeatPath $Config; $maximumAge = Get-WatcherHeartbeatMaximumAgeSeconds $Config
+    $heartbeatStatus = Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds $maximumAge
+    if (-not $heartbeatStatus.Active) { Write-Host ('Follow: there is no active watcher to observe. {0}' -f $heartbeatStatus.Reason); return }
+    $cursors = @{}
+    Write-FollowSnapshot -Config $Config -HeartbeatStatus $heartbeatStatus
+    [void](Get-FollowLogEvents -State (Read-IssueLaunchState -Path $Config.Launch.StatePath) -Cursors $cursors -Initialize)
+    while ($true) {
+        Start-Sleep -Seconds $Config.PollIntervalSeconds
+        $heartbeatStatus = Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds $maximumAge
+        if (-not $heartbeatStatus.Active) { Write-Host ('Follow: the watcher is no longer active. {0}' -f $heartbeatStatus.Reason); return }
+        Write-FollowSnapshot -Config $Config -HeartbeatStatus $heartbeatStatus
+        foreach ($event in @(Get-FollowLogEvents -State (Read-IssueLaunchState -Path $Config.Launch.StatePath) -Cursors $cursors)) {
+            Write-Host ('New JSONL event | {0}#{1} | {2}' -f (Get-DisplayText $event.Repository 35), $event.Issue, $event.Text)
+        }
+    }
+}
+
 function Set-LaunchProperty {
     param([Parameter(Mandatory)]$Launch, [Parameter(Mandatory)][string]$Name, $Value)
     $property = $Launch.PSObject.Properties[$Name]
@@ -346,8 +506,8 @@ function Invoke-LaunchMonitoring {
     }
 }
 function Invoke-MonitorIteration {
-    param([scriptblock]$CredentialReadScript)
-    try { $config = Get-IssueMonitorConfig -Path $ConfigPath } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false; Config = $null } }
+    param([scriptblock]$CredentialReadScript, $ResolvedConfig)
+    try { $config = if ($null -ne $ResolvedConfig) { $ResolvedConfig } else { Get-IssueMonitorConfig -Path $ConfigPath } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false; Config = $null } }
     if ($PSCmdlet.ParameterSetName -eq 'Stop') {
         try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
     }
@@ -359,12 +519,44 @@ function Invoke-MonitorIteration {
         return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config }
     } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
 }
+function Invoke-WatchMode {
+    param([Parameter(Mandatory)]$Config)
+    $mutex = Enter-WatcherInstance $Config
+    if ($null -eq $mutex) {
+        Write-Host 'Watch: another watcher already owns this configuration. Use .\Invoke-IssueMonitor.ps1 -Follow to observe it.'
+        return
+    }
+    try {
+        $instanceId = [Guid]::NewGuid().ToString('N')
+        while ($true) {
+            Write-WatcherHeartbeat -Config $Config -ConfigFilePath $ConfigPath -InstanceId $instanceId
+            $script:ActivityMonitorNotices.Clear()
+            $iteration = Invoke-MonitorIteration -ResolvedConfig $Config
+            Write-WatcherHeartbeat -Config $Config -ConfigFilePath $ConfigPath -InstanceId $instanceId
+            Write-ActivityMonitorSnapshot -Config $iteration.Config -Iteration $iteration
+            Start-Sleep -Seconds $iteration.PollIntervalSeconds
+        }
+    } finally {
+        $mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
+}
 
 if ($MyInvocation.InvocationName -eq '.') { return }
-if (-not $Watch) { [void](Invoke-MonitorIteration); return }
-while ($true) {
-    $script:ActivityMonitorNotices.Clear()
-    $iteration = Invoke-MonitorIteration
-    Write-ActivityMonitorSnapshot -Config $iteration.Config -Iteration $iteration
-    Start-Sleep -Seconds $iteration.PollIntervalSeconds
+try { $resolvedConfig = Get-IssueMonitorConfig -Path $ConfigPath }
+catch { Write-MonitorMessage $_.Exception.Message; return }
+switch ($PSCmdlet.ParameterSetName) {
+    'Follow' { Invoke-FollowMode -Config $resolvedConfig; return }
+    'Watch' { Invoke-WatchMode -Config $resolvedConfig; return }
+    'Once' {
+        $heartbeatStatus = Get-WatcherHeartbeatStatus -HeartbeatPath (Get-WatcherHeartbeatPath $resolvedConfig) -MaximumAgeSeconds (Get-WatcherHeartbeatMaximumAgeSeconds $resolvedConfig)
+        if ($heartbeatStatus.Active -or (Test-WatcherInstanceOwned $resolvedConfig)) {
+            $owner = if ($heartbeatStatus.Active) { 'an active watcher (PID {0})' -f $heartbeatStatus.Heartbeat.pid } else { 'a watcher that is starting or has not yet published a fresh heartbeat' }
+            Write-Host ('Once: {0} already owns this configuration. Use .\Invoke-IssueMonitor.ps1 -Follow instead.' -f $owner)
+            return
+        }
+        [void](Invoke-MonitorIteration -ResolvedConfig $resolvedConfig)
+        return
+    }
+    'Stop' { [void](Invoke-MonitorIteration -ResolvedConfig $resolvedConfig); return }
 }
