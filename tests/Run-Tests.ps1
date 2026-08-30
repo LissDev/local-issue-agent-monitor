@@ -89,6 +89,22 @@ try {
     Assert-Equal $script:readAuthorization ('Bearer ' + $testToken) 'Credential token authorizes Issue reads'
     Assert-True ($script:readUri -match 'state=all') 'GitHub reads open and closed Issues'
 
+    # Invoke-RestMethod can deserialize GitHub timestamps as a string, DateTime,
+    # or DateTimeOffset. Normalization is always culture-independent.
+    $savedCulture = [Globalization.CultureInfo]::CurrentCulture
+    try {
+        [Globalization.CultureInfo]::CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('ru-RU')
+        $timestampStringIssue = New-RawIssue -Number 45
+        $timestampDateTimeIssue = New-RawIssue -Number 46
+        $timestampDateTimeIssue.updated_at = [DateTime]::SpecifyKind([DateTime]::ParseExact('2026-08-30T09:00:00', 'yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), [DateTimeKind]::Utc)
+        $timestampOffsetIssue = New-RawIssue -Number 47
+        $timestampOffsetIssue.updated_at = [DateTimeOffset]::Parse('2026-08-30T12:00:00+03:00', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        Assert-Equal (ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue $timestampStringIssue).UpdatedAt '2026-08-30T09:00:00.0000000+00:00' 'String updated_at is parsed independently of the current culture'
+        Assert-Equal (ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue $timestampDateTimeIssue).UpdatedAt '2026-08-30T09:00:00.0000000+00:00' 'DateTime updated_at does not round-trip through a localized string'
+        Assert-Equal (ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue $timestampOffsetIssue).UpdatedAt '2026-08-30T09:00:00.0000000+00:00' 'DateTimeOffset updated_at retains its instant'
+    }
+    finally { [Globalization.CultureInfo]::CurrentCulture = $savedCulture }
+
     # GitHub REST pagination follows a rel="next" URL without accessing the network.
     $script:pageRequests = 0
     $pagedRequest = {
@@ -630,6 +646,31 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True (-not (Publish-LaunchHumanRequestComment $commentIssue $commentLaunch $commentConfig $testToken $publishRequest)) 'A later poll does not duplicate the human request comment'
     Assert-Equal $script:publishedHumanRequests 1 'Duplicate-poll protection avoids a second Issue comment'
 
+    # If every GitHub repository fails to poll, terminal JSONL is still local
+    # evidence: it must be reconciled and persisted without a synthetic Issue
+    # object or a GitHub label write.
+    $allErrorsStatePath = Join-Path $temporaryRoot 'all-errors\launches.json'
+    $allErrorsLogPath = Join-Path $temporaryRoot 'all-errors\issue-501.jsonl'
+    New-Item -ItemType Directory -Path (Split-Path -Path $allErrorsLogPath -Parent) -Force | Out-Null
+    [IO.File]::WriteAllText($allErrorsLogPath, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"failed","message":"runner failed"}' + "`n" + '{"version":1,"type":"watcher-agent-event","event":"exit","exitCode":1}', [Text.UTF8Encoding]::new($false))
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issue = 'example-org/example-repo#501'; issueNumber = 501; status = 'running'; pid = 2147483647; processStartedAt = '2026-08-30T12:00:00.0000000+00:00'; logPath = $allErrorsLogPath }) }) -Path $allErrorsStatePath
+    $allErrorsConfig = [pscustomobject]@{ Repositories = @('example-org/example-repo'); WatchedLabels = @('status:ready'); PollIntervalSeconds = 60; CredentialProvider = $cliCredentialProvider; Launch = [pscustomobject]@{ Enabled = $true; StatePath = $allErrorsStatePath } }
+    $script:allErrorsIteration = $null
+    $script:allErrorsMessages = [System.Collections.Generic.List[string]]::new()
+    $script:allErrorsIteration = Invoke-MonitorIteration -ResolvedConfig $allErrorsConfig -CredentialProviderScript { param($Provider) [pscustomobject]@{ State = 'available'; Token = $testToken } } -InvokeRestMethodScript { param($Uri, $Headers, $Repository) throw 'fixture network failure' } -MonitorMessageScript { param($Message, $Status) [void]$script:allErrorsMessages.Add($Message) }
+    Assert-True (-not $script:allErrorsIteration.Succeeded) 'An all-error monitor iteration reports GitHub polling as unsuccessful'
+    Assert-Equal (Read-IssueLaunchState -Path $allErrorsStatePath).launches[0].status 'failed' 'All-error polling persists a terminal JSONL outcome instead of leaving a completed launch running'
+    Assert-True ($script:allErrorsMessages[0] -match 'GitHub Issue and label state was not updated' -and $script:allErrorsMessages[0] -match 'Local launch JSONL may still have been reconciled') 'All-error output distinguishes unchanged GitHub state from local launch reconciliation'
+
+    $missingStopLogPath = Join-Path $temporaryRoot 'missing-stop.jsonl'
+    [IO.File]::WriteAllText($missingStopLogPath, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"preserve this artifact"}', [Text.UTF8Encoding]::new($false))
+    $missingStopStatePath = Join-Path $temporaryRoot 'missing-stop\launches.json'
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issue = 'example-org/example-repo#502'; issueNumber = 502; status = 'running'; pid = 2147483647; processStartedAt = '2026-08-30T12:00:00.0000000+00:00'; logPath = $missingStopLogPath }) }) -Path $missingStopStatePath
+    $StopIssue = 'example-org/example-repo#502'
+    Invoke-StopTrackedIssue ([pscustomobject]@{ Launch = [pscustomobject]@{ StatePath = $missingStopStatePath } })
+    Assert-Equal (Read-IssueLaunchState -Path $missingStopStatePath).launches[0].status 'interrupted' 'StopIssue records an identity-verified missing PID as interrupted'
+    Assert-True (Test-Path -LiteralPath $missingStopLogPath -PathType Leaf) 'StopIssue preserves JSONL artifacts when the tracked PID already exited'
+
     # Follow is a strictly local reader: a fresh, identity-verified heartbeat
     # exposes watcher metadata and launch/log activity without calling GitHub or
     # changing launch state.  Its first read tails existing JSONL rather than
@@ -712,6 +753,8 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $displayIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -UpdatedAt '2026-08-30T09:00:00Z')
     $normalOutput = (& { Write-IssueMonitorEvent ([pscustomobject]@{ Status = 'updated'; IsWatched = $false; Issue = $displayIssue }) } 6>&1 | Out-String)
     Assert-True ($normalOutput -match [regex]::Escape($expectedLocalTimestamp) -and $normalOutput -notmatch '2026-08-30 09:00:00Z') 'Normal monitor output renders GitHub UTC timestamps in local time'
+    $errorOutput = (& { Write-IssueMonitorEvent ([pscustomobject]@{ Status = 'error'; IsWatched = $false; Repository = 'example-org/example-repo'; Message = 'fixture error'; Issue = $null }) } 6>&1 | Out-String)
+    Assert-True ($errorOutput -match 'fixture error' -and $errorOutput -notmatch "property 'Labels'") 'An error event without an Issue payload never tries to read Labels'
     $noticeOutput = (& { Write-MonitorMessage 'Local display formatting check.' } 6>&1 | Out-String)
     Assert-True ($noticeOutput -match '[+-][0-9]{2}:[0-9]{2}') 'Monitor notices use the local display convention'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
