@@ -73,8 +73,9 @@ JSONL, then choose one of these human actions:
 - continue the worktree manually if the partial result is useful;
 - use `-StopIssue owner/repository#123` for an intentional interruption (it
   stops only that recorded PID); or
-- preserve the existing artifacts and create a fresh Issue/request for a new
-  isolated run.
+- after a terminal agent status, add `agent:run` again to start a new tracked
+  process in the preserved Issue worktree and branch. Its prior JSONL log stays
+  available through its launch-state record.
 
 Once a PR is merged and its Issue is closed, an integration coordinator may
 clean up the associated local worktree and branch. It must first verify the

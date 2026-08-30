@@ -410,6 +410,46 @@ function Test-IssueLaunchBranchSafety {
     return $true
 }
 
+function Test-IssueLaunchWorktreeReuseSafety {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorktreePath,
+        [Parameter(Mandatory)][string]$WorktreeDirectory,
+        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string]$Branch,
+        [scriptblock]$TestPathScript,
+        [scriptblock]$GitScript
+    )
+    $root = [IO.Path]::GetFullPath($WorktreeDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $candidate = [IO.Path]::GetFullPath($WorktreePath)
+    $repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (-not $candidate.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $candidate.StartsWith($repository + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Recorded retry worktree '$candidate' is outside its configured safe location."
+    }
+    $exists = if ($null -ne $TestPathScript) { & $TestPathScript -Path $candidate -PathType Container } else { Test-Path -LiteralPath $candidate -PathType Container }
+    if (-not $exists) { throw "Recorded retry worktree '$candidate' no longer exists; it will not be recreated or replaced." }
+    $knownWorktrees = if ($null -eq $GitScript) {
+        & git -C $RepositoryPath worktree list --porcelain
+        if ($LASTEXITCODE -ne 0) { throw "Git could not list worktrees for '$RepositoryPath'." }
+    }
+    else { @(& $GitScript -RepositoryPath $RepositoryPath -Arguments @('worktree', 'list', '--porcelain')) }
+    $registeredWorktrees = @($knownWorktrees | Where-Object { ([string]$_).StartsWith('worktree ') } | ForEach-Object {
+        [IO.Path]::GetFullPath(([string]$_).Substring(9))
+    })
+    if (@($registeredWorktrees | Where-Object { $_ -eq $candidate }).Count -ne 1) {
+        throw "Recorded retry worktree '$candidate' is not registered by Git; it will not be reused."
+    }
+    $actualBranch = if ($null -eq $GitScript) {
+        & git -C $candidate branch --show-current
+        if ($LASTEXITCODE -ne 0) { throw "Git could not determine the branch for recorded retry worktree '$candidate'." }
+    }
+    else { @(& $GitScript -RepositoryPath $candidate -Arguments @('branch', '--show-current')) }
+    if (([string]($actualBranch | Select-Object -First 1)).Trim() -ne $Branch) {
+        throw "Recorded retry worktree '$candidate' is not checked out on expected branch '$Branch'."
+    }
+    return $true
+}
+
 function Test-IssueLaunchRepositorySafety {
     [CmdletBinding()]
     param(
@@ -445,6 +485,10 @@ function New-IssueLaunchWorktree {
     )
     if (-not $Plan.Eligible) { throw "Cannot create a worktree for an ineligible Issue: $($Plan.Reason)." }
     Test-IssueLaunchStatePathSafety -StatePath $Launch.StatePath -RepositoryPath $Plan.RepositoryPath | Out-Null
+    if ([bool]$Plan.ReuseExistingWorktree) {
+        Test-IssueLaunchWorktreeReuseSafety -WorktreePath $Plan.WorktreePath -WorktreeDirectory $Launch.WorktreeDirectory -RepositoryPath $Plan.RepositoryPath -Branch $Plan.Branch -TestPathScript $TestPathScript -GitScript $GitScript | Out-Null
+        return [pscustomobject]@{ Created = $false; Reused = $true; Path = $Plan.WorktreePath; Branch = $Plan.Branch }
+    }
     Test-IssueLaunchRepositorySafety -RepositoryPath $Plan.RepositoryPath -GitScript $GitScript | Out-Null
     Test-IssueLaunchWorktreeSafety -WorktreePath $Plan.WorktreePath -WorktreeDirectory $Launch.WorktreeDirectory -RepositoryPath $Plan.RepositoryPath -TestPathScript $TestPathScript -GitScript $GitScript | Out-Null
     Test-IssueLaunchBranchSafety -RepositoryPath $Plan.RepositoryPath -Branch $Plan.Branch -GitScript $GitScript | Out-Null
@@ -542,20 +586,28 @@ function New-IssueLaunchPlan {
     $eligibility = Get-IssueLaunchEligibility -Issue $Issue -Launch $Launch
     if (-not $eligibility.Eligible) { return [pscustomobject]@{ Eligible = $false; Reason = $eligibility.Reason } }
     $target = Resolve-IssueLaunchRepositoryTarget -Repository $Issue.Repository -Launch $Launch -TestPathScript $TestPathScript
-    $priorAttempts = @($PriorLaunches | Where-Object { $null -ne $_ -and [string]$_.repository -eq [string]$Issue.Repository -and [int]$_.issueNumber -eq [int]$Issue.Number }).Count
-    $attempt = $priorAttempts + 1
-    $branch = New-IssueLaunchBranch -Type $eligibility.Type -IssueNumber $Issue.Number -ShortName $Issue.Title -Attempt $attempt
-    $repositoryToken = ConvertTo-IssueLaunchRepositoryIdentifier -Repository $Issue.Repository
-    $worktreeLeaf = 'issue-' + [int]$Issue.Number
-    if ($attempt -gt 1) { $worktreeLeaf += ('-attempt-' + $attempt) }
-    $worktreePath = Join-Path -Path $Launch.WorktreeDirectory -ChildPath (Join-Path -Path $repositoryToken -ChildPath $worktreeLeaf)
-    Test-IssueLaunchWorktreeSafety -WorktreePath $worktreePath -WorktreeDirectory $Launch.WorktreeDirectory -RepositoryPath $target.LocalPath -TestPathScript $TestPathScript -GitScript $GitScript | Out-Null
-    Test-IssueLaunchBranchSafety -RepositoryPath $target.LocalPath -Branch $branch -GitScript $GitScript | Out-Null
-    Test-IssueLaunchRepositorySafety -RepositoryPath $target.LocalPath -GitScript $GitScript | Out-Null
+    $priorLaunchesForIssue = @($PriorLaunches | Where-Object { $null -ne $_ -and [string]$_.repository -eq [string]$Issue.Repository -and [int]$_.issueNumber -eq [int]$Issue.Number })
+    $priorLaunch = @($priorLaunchesForIssue | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.branch) -and -not [string]::IsNullOrWhiteSpace([string]$_.path) } | Select-Object -Last 1)
+    $reuseExistingWorktree = $priorLaunch.Count -eq 1
+    $attempt = if ($reuseExistingWorktree) { [int]$priorLaunch[0].attempt + 1 } else { 1 }
+    if ($attempt -lt 1) { $attempt = $priorLaunchesForIssue.Count + 1 }
+    if ($reuseExistingWorktree) {
+        $branch = [string]$priorLaunch[0].branch
+        $worktreePath = [IO.Path]::GetFullPath([string]$priorLaunch[0].path)
+        Test-IssueLaunchWorktreeReuseSafety -WorktreePath $worktreePath -WorktreeDirectory $Launch.WorktreeDirectory -RepositoryPath $target.LocalPath -Branch $branch -TestPathScript $TestPathScript -GitScript $GitScript | Out-Null
+    }
+    else {
+        $branch = New-IssueLaunchBranch -Type $eligibility.Type -IssueNumber $Issue.Number -ShortName $Issue.Title
+        $repositoryToken = ConvertTo-IssueLaunchRepositoryIdentifier -Repository $Issue.Repository
+        $worktreePath = Join-Path -Path $Launch.WorktreeDirectory -ChildPath (Join-Path -Path $repositoryToken -ChildPath ('issue-' + [int]$Issue.Number))
+        Test-IssueLaunchWorktreeSafety -WorktreePath $worktreePath -WorktreeDirectory $Launch.WorktreeDirectory -RepositoryPath $target.LocalPath -TestPathScript $TestPathScript -GitScript $GitScript | Out-Null
+        Test-IssueLaunchBranchSafety -RepositoryPath $target.LocalPath -Branch $branch -GitScript $GitScript | Out-Null
+        Test-IssueLaunchRepositorySafety -RepositoryPath $target.LocalPath -GitScript $GitScript | Out-Null
+    }
     Test-IssueLaunchStatePathSafety -StatePath $Launch.StatePath -RepositoryPath $target.LocalPath | Out-Null
     return [pscustomobject]@{
-        Eligible = $true; Issue = $Issue; RepositoryPath = $target.LocalPath; Branch = $branch; Attempt = $attempt
-        BaseCommit = (Get-IssueLaunchHeadCommit -RepositoryPath $target.LocalPath -GitScript $GitScript)
+        Eligible = $true; Issue = $Issue; RepositoryPath = $target.LocalPath; Branch = $branch; Attempt = $attempt; ReuseExistingWorktree = $reuseExistingWorktree
+        BaseCommit = (Get-IssueLaunchHeadCommit -RepositoryPath $(if ($reuseExistingWorktree) { $worktreePath } else { $target.LocalPath }) -GitScript $GitScript)
         WorktreePath = [IO.Path]::GetFullPath($worktreePath); Prompt = (New-IssueLaunchPrompt -Issue $Issue -Branch $branch -WorktreePath ([IO.Path]::GetFullPath($worktreePath)))
     }
 }
@@ -912,6 +964,12 @@ function Start-IssueAgentRunner {
     if (-not (Test-Path -LiteralPath $workingDirectory -PathType Container)) {
         throw "Agent working directory '$workingDirectory' does not exist."
     }
+    if (-not (Test-Path -LiteralPath $stateDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $stateDirectory -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
+        [IO.File]::WriteAllText($logPath, '', [Text.UTF8Encoding]::new($false))
+    }
     Test-IssueAgentRunner -Runner $Runner | Out-Null
     return (& $Runner.Start $Runner $Prompt $logPath $stateDirectory $workingDirectory)
 }
@@ -933,6 +991,7 @@ function Start-CodexIssueAgentRunnerProcess {
     $commandBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Command))
     $runner = @"
 `$ErrorActionPreference = 'Continue'
+Remove-Item -LiteralPath Env:GITHUB_ISSUES_TOKEN -ErrorAction SilentlyContinue
 `$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$promptBase64'))
 `$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
 `$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
@@ -1000,9 +1059,7 @@ exit `$exitCode
     $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-IssueLaunchCommandLineArgument -Value $runnerPath)
     $startInfo.WorkingDirectory = $workingDirectory
     $startInfo.UseShellExecute = $false
-    # The GitHub token authorizes the monitor only.  The Codex child uses its own
-    # local sign-in and must not inherit this unrelated credential.
-    [void]$startInfo.EnvironmentVariables.Remove('GITHUB_ISSUES_TOKEN')
+    # The wrapper removes the GitHub token before it starts the Codex child.
     $process = [Diagnostics.Process]::Start($startInfo)
     if ($null -eq $process -or $process.Id -lt 1) { throw 'Could not start the separate PowerShell Codex process.' }
     $processStartedAt = try { [DateTimeOffset]$process.StartTime.ToUniversalTime() } catch { [DateTimeOffset]::UtcNow }
@@ -1032,6 +1089,7 @@ function Start-ExternalIssueAgentRunnerProcess {
     $promptFileArgumentBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PromptFileArgument))
     $runner = @"
 `$ErrorActionPreference = 'Continue'
+Remove-Item -LiteralPath Env:GITHUB_ISSUES_TOKEN -ErrorAction SilentlyContinue
 `$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$promptBase64'))
 `$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
 `$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
@@ -1101,7 +1159,6 @@ exit `$exitCode
     $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-IssueLaunchCommandLineArgument -Value $runnerPath)
     $startInfo.WorkingDirectory = $WorkingDirectory
     $startInfo.UseShellExecute = $false
-    [void]$startInfo.EnvironmentVariables.Remove('GITHUB_ISSUES_TOKEN')
     $process = [Diagnostics.Process]::Start($startInfo)
     if ($null -eq $process -or $process.Id -lt 1) { throw 'Could not start the separate PowerShell external runner process.' }
     $processStartedAt = try { [DateTimeOffset]$process.StartTime.ToUniversalTime() } catch { [DateTimeOffset]::UtcNow }
@@ -1174,12 +1231,14 @@ function Request-IssueLaunchAgentLabel {
     }
     $label = if ($Status -eq 'running') { 'agent:running' } else { 'agent:' + $Status }
     $removeLabel = if ($PSBoundParameters.ContainsKey('CurrentAgentStatus')) { 'agent:' + $CurrentAgentStatus } elseif ($Status -eq 'running') { 'agent:run' } else { 'agent:running' }
+    $agentLabels = @('agent:run', 'agent:running', 'agent:needs-human', 'agent:failed', 'agent:done')
+    $labels = @($Issue.Labels | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -notin $agentLabels }) + @($label)
     if ($null -ne $LabelRequestScript) {
-        & $LabelRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label
+        & $LabelRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -Labels @($labels | Select-Object -Unique)
     }
     else {
         if ([string]::IsNullOrWhiteSpace($GitHubToken)) { throw 'No GitHub token was supplied for the agent label update.' }
-        Invoke-GitHubIssueLabelUpdate -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label -GitHubToken $GitHubToken -InvokeRestMethodScript $InvokeRestMethodScript
+        Invoke-GitHubIssueLabelUpdate -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -Issue $Issue -AddLabel $label -GitHubToken $GitHubToken -InvokeRestMethodScript $InvokeRestMethodScript
     }
     return [pscustomobject]@{ Requested = $true; Reason = 'requested'; Label = $label }
 }
@@ -1616,7 +1675,7 @@ function Invoke-GitHubIssueLabelUpdate {
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository,
         [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$IssueNumber,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RemoveLabel,
+        [Parameter(Mandatory)]$Issue,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AddLabel,
         [string]$GitHubToken,
         [AllowNull()]$CredentialProvider,
@@ -1629,15 +1688,15 @@ function Invoke-GitHubIssueLabelUpdate {
     $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $baseUri = "https://api.github.com/repos/$encodedRepository/issues/$IssueNumber/labels"
+    $agentLabels = @('agent:run', 'agent:running', 'agent:needs-human', 'agent:failed', 'agent:done')
+    $labels = @($Issue.Labels | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -notin $agentLabels }) + @($AddLabel)
+    $payload = @{ labels = @($labels | Select-Object -Unique) } | ConvertTo-Json -Compress
     try {
         if ($null -ne $InvokeRestMethodScript) {
-            & $InvokeRestMethodScript -Uri $baseUri -Headers $headers -Method 'Post' -Body (@{ labels = @($AddLabel) } | ConvertTo-Json -Compress) | Out-Null
-            & $InvokeRestMethodScript -Uri ($baseUri + '/' + [uri]::EscapeDataString($RemoveLabel)) -Headers $headers -Method 'Delete' -Body $null | Out-Null
+            & $InvokeRestMethodScript -Uri $baseUri -Headers $headers -Method 'Put' -Body $payload | Out-Null
         }
         else {
-            # Add before delete so a failed delete preserves agent:run instead of losing the request.
-            Invoke-RestMethod -Uri $baseUri -Headers $headers -Method Post -ContentType 'application/json' -Body (@{ labels = @($AddLabel) } | ConvertTo-Json -Compress) -ErrorAction Stop | Out-Null
-            Invoke-RestMethod -Uri ($baseUri + '/' + [uri]::EscapeDataString($RemoveLabel)) -Headers $headers -Method Delete -ErrorAction Stop | Out-Null
+            Invoke-RestMethod -Uri $baseUri -Headers $headers -Method Put -ContentType 'application/json' -Body $payload -ErrorAction Stop | Out-Null
         }
     }
     catch {
