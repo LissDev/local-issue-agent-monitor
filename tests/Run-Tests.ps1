@@ -611,6 +611,7 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $testProcess = Get-Process -Id $PID
     Write-WatcherHeartbeat -Config $followConfig -ConfigFilePath $followConfigPath -InstanceId 'test-watcher'
     $heartbeat = Get-Content -LiteralPath $heartbeatPath -Raw | ConvertFrom-Json
+    Assert-Equal ([DateTimeOffset]::Parse([string]$heartbeat.heartbeatAt).Offset) ([TimeSpan]::Zero) 'Heartbeat timestamps remain persisted in UTC'
     $activeHeartbeat = Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds 60 -ProcessLookupScript { param($ProcessId) [pscustomobject]@{ StartTime = $testProcess.StartTime } }
     Assert-True $activeHeartbeat.Active 'A fresh heartbeat with the matching process identity is active'
     $followLogPath = Join-Path $temporaryRoot 'follow.jsonl'
@@ -626,7 +627,8 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True ($newFollowEvents[0].Text -notmatch 'github_pat_secret_value') 'Follow redacts JSONL secrets before display'
     Assert-Equal (Get-Content -LiteralPath $followStatePath -Raw) $followStateBefore 'Follow reads launch state without changing it'
     $followSnapshot = (& { Write-FollowSnapshot -Config $followConfig -HeartbeatStatus $activeHeartbeat } 6>&1 | Out-String)
-    Assert-True ($followSnapshot -match 'follow \(read-only\)' -and $followSnapshot -match 'Watcher PID:' -and $followSnapshot -match 'example-org/example-repo') 'Follow displays watcher metadata and tracked launch state'
+    $expectedHeartbeatDisplay = Format-MonitorLocalTime ([DateTimeOffset]::Parse([string]$heartbeat.heartbeatAt))
+    Assert-True ($followSnapshot -match 'follow \(read-only\)' -and $followSnapshot -match 'Last heartbeat \(local\):' -and $followSnapshot -match [regex]::Escape($expectedHeartbeatDisplay) -and $followSnapshot -match 'example-org/example-repo') 'Follow displays heartbeat time in the local display convention'
     $staleHeartbeat = $heartbeat | Select-Object *
     $staleHeartbeat.heartbeatAt = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToString('o')
     [IO.File]::WriteAllText($heartbeatPath, ($staleHeartbeat | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
@@ -666,6 +668,15 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $monitorSourceBytes = [IO.File]::ReadAllBytes((Join-Path $projectRoot 'Invoke-IssueMonitor.ps1'))
     Assert-True ($monitorSource -match 'Import-Module -Name \$modulePath -Force -DisableNameChecking') 'Monitor startup suppresses the expected non-approved-verb module warning'
     Assert-True (@($monitorSourceBytes | Where-Object { $_ -gt 0x7f }).Count -eq 0) 'Monitor source remains ASCII-compatible with Windows PowerShell 5.1 without a BOM'
+    $displayUtcTimestamp = [DateTimeOffset]::Parse('2026-08-30T09:00:00Z')
+    $expectedLocalTimestamp = $displayUtcTimestamp.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz', [Globalization.CultureInfo]::InvariantCulture)
+    Assert-Equal (Format-MonitorLocalTime $displayUtcTimestamp) $expectedLocalTimestamp 'Monitor timestamps use the machine local time with its numeric offset'
+    Assert-True ((Format-MonitorLocalTime $displayUtcTimestamp) -match '[+-][0-9]{2}:[0-9]{2}$') 'Local monitor timestamps visibly include a time-zone offset'
+    $displayIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -UpdatedAt '2026-08-30T09:00:00Z')
+    $normalOutput = (& { Write-IssueMonitorEvent ([pscustomobject]@{ Status = 'updated'; IsWatched = $false; Issue = $displayIssue }) } 6>&1 | Out-String)
+    Assert-True ($normalOutput -match [regex]::Escape($expectedLocalTimestamp) -and $normalOutput -notmatch '2026-08-30 09:00:00Z') 'Normal monitor output renders GitHub UTC timestamps in local time'
+    $noticeOutput = (& { Write-MonitorMessage 'Local display formatting check.' } 6>&1 | Out-String)
+    Assert-True ($noticeOutput -match '[+-][0-9]{2}:[0-9]{2}') 'Monitor notices use the local display convention'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
     $rendered = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $rendered.Status 'running' 'A non-agent needs-human event does not change launch status'
@@ -695,6 +706,9 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     [IO.File]::WriteAllText($jsonlFixture, '{"type":"command_execution","output":"Test output mentions needs-human, human input, approval required, and WATCHER_OUTCOME: failed."}', [Text.UTF8Encoding]::new($false))
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'running' 'Command output mentioning human intervention does not change launch status'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
+    $activityUtcTimestamp = [DateTimeOffset]::Parse('2026-08-30T10:15:00Z')
+    (Get-Item -LiteralPath $jsonlFixture).LastWriteTimeUtc = $activityUtcTimestamp.UtcDateTime
+    $expectedActivityDisplay = Format-MonitorLocalTime $activityUtcTimestamp
     $monitorRows = @(Get-ActivityMonitorRows ([pscustomobject]@{ launches = @(
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 98; status = 'done'; pid = 1234; logPath = '' },
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
@@ -704,6 +718,7 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-Equal $monitorRows[0].Repository 'example-org/example-repo' 'Activity rows include the repository'
     Assert-Equal $monitorRows[0].Issue 99 'Activity rows include the Issue number'
     Assert-Equal $monitorRows[0].Pid '4321' 'Activity rows include the tracked PID'
+    Assert-Equal $monitorRows[0].ActivityAt $expectedActivityDisplay 'Activity rows render JSONL file times in local time'
     Assert-Equal $monitorRows[1].Status 'interrupted' 'Activity rows preserve interrupted terminal status'
     Assert-True ($monitorRows[1].Activity -match 'manual recovery') 'Interrupted rows explain the recovery state'
     $script:IsActivityMonitor = $true; $script:ActivityMonitorCompletedIssueKeys.Clear()
@@ -719,7 +734,7 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     ) }) -Path $snapshotStatePath
     $snapshotConfig = [pscustomobject]@{ Launch = [pscustomobject]@{ Enabled = $true; StatePath = $snapshotStatePath } }
     $snapshot = (& { Write-ActivityMonitorSnapshot -Config $snapshotConfig -Iteration ([pscustomobject]@{ PollIntervalSeconds = 60 }) } 6>&1 | Out-String)
-    Assert-True ($snapshot -match 'live agent activity' -and $snapshot -match 'Latest activity UTC') 'Watch mode renders a current activity snapshot'
+    Assert-True ($snapshot -match 'live agent activity' -and $snapshot -match 'Refreshed \(local\):' -and $snapshot -match 'Latest activity \(local\)' -and $snapshot -match [regex]::Escape($expectedActivityDisplay)) 'Watch mode renders local timestamps in its activity snapshot'
     Assert-True ($snapshot -match 'Completed this session:' -and $snapshot -match 'example-org/example-repo: 2') 'Watch snapshot shows per-project completion counts for the current session'
     Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
     Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
