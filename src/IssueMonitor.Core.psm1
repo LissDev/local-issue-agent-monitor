@@ -622,15 +622,22 @@ function Request-IssueLaunchAgentLabel {
         [Parameter(Mandatory)][ValidateSet('running', 'done', 'needs-human', 'failed')][string]$Status,
         [ValidateSet('run', 'running')][string]$CurrentAgentStatus,
         [switch]$WhatIf,
-        [scriptblock]$LabelRequestScript
+        [scriptblock]$LabelRequestScript,
+        [string]$GitHubToken,
+        [scriptblock]$InvokeRestMethodScript
     )
     if (-not [bool]$Launch.Enabled -or $WhatIf) {
         return [pscustomobject]@{ Requested = $false; Reason = if ($WhatIf) { 'what-if' } else { 'launch-disabled' }; Label = $null }
     }
     $label = if ($Status -eq 'running') { 'agent:running' } else { 'agent:' + $Status }
     $removeLabel = if ($PSBoundParameters.ContainsKey('CurrentAgentStatus')) { 'agent:' + $CurrentAgentStatus } elseif ($Status -eq 'running') { 'agent:run' } else { 'agent:running' }
-    if ($null -eq $LabelRequestScript) { throw 'No label request seam was supplied; no GitHub label API call was made.' }
-    & $LabelRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label
+    if ($null -ne $LabelRequestScript) {
+        & $LabelRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($GitHubToken)) { throw 'No GitHub token was supplied for the agent label update.' }
+        Invoke-GitHubIssueLabelUpdate -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -RemoveLabel $removeLabel -AddLabel $label -GitHubToken $GitHubToken -InvokeRestMethodScript $InvokeRestMethodScript
+    }
     return [pscustomobject]@{ Requested = $true; Reason = 'requested'; Label = $label }
 }
 

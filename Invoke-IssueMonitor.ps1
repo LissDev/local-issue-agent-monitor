@@ -72,10 +72,6 @@ function Get-LaunchJsonlStatus {
     return [pscustomobject]@{ Status = $status; Detail = (Get-DisplayText $detail 120) }
 }
 
-function Invoke-AgentLabelUpdate {
-    param([Parameter(Mandatory)][string]$Repository, [Parameter(Mandatory)][int]$IssueNumber, [Parameter(Mandatory)][string]$RemoveLabel, [Parameter(Mandatory)][string]$AddLabel, [Parameter(Mandatory)][string]$GitHubToken)
-    Invoke-GitHubIssueLabelUpdate -Repository $Repository -IssueNumber $IssueNumber -RemoveLabel $RemoveLabel -AddLabel $AddLabel -GitHubToken $GitHubToken
-}
 function Set-LaunchProperty {
     param([Parameter(Mandatory)]$Launch, [Parameter(Mandatory)][string]$Name, $Value)
     $property = $Launch.PSObject.Properties[$Name]
@@ -88,8 +84,7 @@ function Invoke-LaunchLabelTransition {
     if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or $currentLabelStatus -eq $Status) { return $false }
     try {
         $removeAgentStatus = if ($currentLabelStatus -eq 'running') { 'running' } else { 'run' }
-        $labelUpdate = { param($Repository, $IssueNumber, $RemoveLabel, $AddLabel) Invoke-AgentLabelUpdate -Repository $Repository -IssueNumber $IssueNumber -RemoveLabel $RemoveLabel -AddLabel $AddLabel -GitHubToken $GitHubToken }.GetNewClosure()
-        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus $removeAgentStatus -LabelRequestScript $labelUpdate | Out-Null
+        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus $removeAgentStatus -GitHubToken $GitHubToken | Out-Null
         Set-LaunchProperty $Launch 'labelStatus' $Status; return $true
     } catch { Write-LaunchEvent 'failed' $Issue ('GitHub label update failed; local process was left untouched: ' + $_.Exception.Message); return $false }
 }

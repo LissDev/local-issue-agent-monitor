@@ -289,7 +289,8 @@ try {
         $script:labelAuthorization = $Headers.Authorization
         [pscustomobject]@{}
     }
-    Invoke-GitHubIssueLabelUpdate -Repository 'example-org/example-repo' -IssueNumber 77 -RemoveLabel 'agent:run' -AddLabel 'agent:running' -GitHubToken $testToken -InvokeRestMethodScript $labelHttpRequest
+    $directLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -GitHubToken $testToken -InvokeRestMethodScript $labelHttpRequest
+    Assert-True $directLabel.Requested 'Production label transition runs in the Core module without a script callback'
     Assert-Equal $script:labelHttpCalls 2 'Credential token authorizes both label API requests'
     Assert-Equal $script:labelAuthorization ('Bearer ' + $testToken) 'Credential token authorizes agent label updates'
 
