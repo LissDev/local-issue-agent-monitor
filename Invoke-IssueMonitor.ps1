@@ -54,22 +54,41 @@ function Write-LaunchEvent {
 
 function Get-LaunchJsonlStatus {
     param([Parameter(Mandatory)]$Launch)
-    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = '' } }
-    $status = [string]$Launch.status; $detail = ''
+    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; HasOutcomeMarker = $false; ProcessExited = $false } }
+    $marker = $null; $detail = ''; $requestedHuman = $false; $runnerExitCode = $null
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         $text = [string]$line
+        $agentText = ''
         try {
             $json = $text | ConvertFrom-Json -ErrorAction Stop; $parts = @()
-            foreach ($name in @('type', 'event', 'status', 'message', 'error')) { if ($null -ne $json.PSObject.Properties[$name]) { $parts += [string]$json.$name } }
+            foreach ($name in @('type', 'event', 'status', 'message', 'error', 'output')) { if ($null -ne $json.PSObject.Properties[$name]) { $parts += [string]$json.$name } }
             if ($parts.Count -gt 0) { $text = $parts -join ' ' }
+            $item = if ($null -ne $json.PSObject.Properties['item']) { $json.item } else { $null }
+            if ($null -ne $item -and $null -ne $item.PSObject.Properties['type'] -and [string]$item.type -eq 'agent_message') {
+                foreach ($name in @('text', 'message', 'output')) { if ($null -ne $item.PSObject.Properties[$name]) { $agentText += [string]$item.$name } }
+            }
+            elseif ($null -ne $json.PSObject.Properties['type'] -and [string]$json.type -eq 'agent_message') {
+                foreach ($name in @('text', 'message', 'output')) { if ($null -ne $json.PSObject.Properties[$name]) { $agentText += [string]$json.$name } }
+            }
+            if ($null -ne $json.PSObject.Properties['type'] -and [string]$json.type -eq 'watcher-runner-exit' -and $null -ne $json.PSObject.Properties['exitCode']) {
+                $parsedExitCode = 0
+                if ([int]::TryParse([string]$json.exitCode, [ref]$parsedExitCode)) { $runnerExitCode = $parsedExitCode }
+            }
         } catch { }
         $safeText = Protect-MonitorText $text
-        if ($safeText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required') { $status = 'needs-human'; $detail = $safeText }
-        elseif ($safeText -match '(?i)(failed|failure|\berror\b|exception)') { $status = 'failed'; $detail = $safeText }
-        elseif ($safeText -match '(?i)(completed|complete|success|finished)') { $status = 'done'; $detail = $safeText }
+        $safeAgentText = Protect-MonitorText $agentText
+        $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(done|needs-human|failed)\b')
+        if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
+        if ($safeText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required' -or $safeAgentText -match '(?i)need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
+            $requestedHuman = $true; if ([string]::IsNullOrWhiteSpace($detail)) { $detail = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText } }
+        }
     }
-    return [pscustomobject]@{ Status = $status; Detail = (Get-DisplayText $detail 120) }
+    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true } }
+    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode) } }
+    if ($requestedHuman) { return [pscustomobject]@{ Status = 'needs-human'; Detail = (Get-DisplayText $detail 120); HasOutcomeMarker = $false; ProcessExited = ($null -ne $runnerExitCode) } }
+    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; HasOutcomeMarker = $false; ProcessExited = $true } }
+    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; HasOutcomeMarker = $false; ProcessExited = $false }
 }
 
 function Set-LaunchProperty {
@@ -83,8 +102,15 @@ function Invoke-LaunchLabelTransition {
     $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
     if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or $currentLabelStatus -eq $Status) { return $false }
     try {
-        $removeAgentStatus = if ($currentLabelStatus -eq 'running') { 'running' } else { 'run' }
+        $previousAgentStatusProperty = $Launch.PSObject.Properties['previousAgentStatus']
+        $previousAgentStatus = if ($null -eq $previousAgentStatusProperty) { '' } else { [string]$previousAgentStatusProperty.Value }
+        $removeAgentStatus = if ($currentLabelStatus -eq 'running') { 'running' } elseif ($previousAgentStatus -in @('done', 'needs-human', 'failed')) { $previousAgentStatus } else { 'run' }
         Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus $removeAgentStatus -GitHubToken $GitHubToken | Out-Null
+        if ($Status -eq 'running' -and $previousAgentStatus -in @('done', 'needs-human', 'failed')) {
+            # A conscious retry normally adds agent:run alongside the old terminal
+            # label. Remove both lifecycle labels so this attempt has one status.
+            Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus 'run' -GitHubToken $GitHubToken | Out-Null
+        }
         Set-LaunchProperty $Launch 'labelStatus' $Status; return $true
     } catch { Write-LaunchEvent 'failed' $Issue ('GitHub label update failed; local process was left untouched: ' + $_.Exception.Message); return $false }
 }
@@ -114,6 +140,10 @@ function Invoke-LaunchMonitoring {
         return
     }
     $state = Read-IssueLaunchState -Path $Config.Launch.StatePath; $stateChanged = $false
+    $issuesByKey = @{}
+    foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
+        $issuesByKey[('{0}#{1}' -f $event.Issue.Repository, $event.Issue.Number)] = $event.Issue
+    }
     foreach ($launch in @($state.launches)) {
         $keyIssue = [pscustomobject]@{ Repository = [string]$launch.repository; Number = [int]$launch.issueNumber }
         if ([string]$launch.status -ne 'running') {
@@ -121,7 +151,9 @@ function Invoke-LaunchMonitoring {
             if ([string]$launch.status -in @('done', 'needs-human', 'failed')) {
                 $labelStatusProperty = $launch.PSObject.Properties['labelStatus']
                 $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
-                if ($currentLabelStatus -ne [string]$launch.status) {
+                $currentIssue = $issuesByKey[([string]$launch.issue)]
+                $isExplicitRetry = $null -ne $currentIssue -and @($currentIssue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0 -and ([string]$launch.status -in @('done', 'needs-human'))
+                if ($currentLabelStatus -ne [string]$launch.status -and -not $isExplicitRetry) {
                     if (Invoke-LaunchLabelTransition $keyIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
                 }
             }
@@ -134,8 +166,14 @@ function Invoke-LaunchMonitoring {
         }
         $jsonl = Get-LaunchJsonlStatus $launch
         if ($jsonl.Status -ne 'running') {
-            Set-LaunchProperty $launch 'status' $jsonl.Status; $stateChanged = $true; Write-LaunchEvent $jsonl.Status $keyIssue $jsonl.Detail
-            if ($jsonl.Status -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $jsonl.Status $GitHubToken) { $stateChanged = $true } }
+            $terminalStatus = [string]$jsonl.Status
+            $terminalDetail = [string]$jsonl.Detail
+            if ($terminalStatus -eq 'done') {
+                $commitCheck = Test-IssueLaunchHasNewCommit -LaunchMetadata $launch
+                if (-not $commitCheck.HasNewCommit) { $terminalStatus = 'needs-human'; $terminalDetail = $commitCheck.Message }
+            }
+            Set-LaunchProperty $launch 'status' $terminalStatus; $stateChanged = $true; Write-LaunchEvent $terminalStatus $keyIssue $terminalDetail
+            if ($terminalStatus -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $terminalStatus $GitHubToken) { $stateChanged = $true } }
         }
     }
     # A completed child can disappear before the next poll.  Parse its JSONL
@@ -154,23 +192,32 @@ function Invoke-LaunchMonitoring {
     if ($stateChanged -and -not $WhatIf) { Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath }
     foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
         $issue = $event.Issue; $known = @(Find-IssueLaunchMetadata -State $state -Repository $issue.Repository -IssueNumber $issue.Number)
-        if ($known.Count -gt 0) { continue }
+        if (@($known | Where-Object { [string]$_.status -eq 'running' }).Count -gt 0) { continue }
         $eligibility = Get-IssueLaunchEligibility -Issue $issue -Launch $Config.Launch
         if (-not $eligibility.Eligible) { continue }
         Write-LaunchEvent 'queued' $issue 'agent:run is eligible.'
         try {
             Write-LaunchEvent 'preflight' $issue 'Checking branch, base repository, and isolated worktree path.'
-            $plan = New-IssueLaunchPlan -Issue $issue -Launch $Config.Launch
+            $plan = New-IssueLaunchPlan -Issue $issue -Launch $Config.Launch -PriorLaunches $known
             if ($WhatIf) { Write-LaunchEvent 'preflight' $issue ("WhatIf plan: branch={0}; worktree={1}; command={2} exec --json" -f $plan.Branch, $plan.WorktreePath, $Config.Launch.CodexCommand); continue }
             if ($null -eq (Get-Command -Name $Config.Launch.CodexCommand -ErrorAction SilentlyContinue)) { throw "Configured Codex command '$($Config.Launch.CodexCommand)' was not found. No worktree was created." }
             New-IssueLaunchWorktree -Plan $plan -Launch $Config.Launch | Out-Null
             $stateDirectory = Split-Path -Path $Config.Launch.StatePath -Parent; $logPath = Join-Path $stateDirectory ('issue-{0}-{1}.jsonl' -f $issue.Number, [Guid]::NewGuid().ToString('N'))
             $process = Start-IssueLaunchProcess -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath -CodexCommand $Config.Launch.CodexCommand
             $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $process.Id -LogPath $process.LogPath -ProcessStartedAt $process.StartedAt; Set-LaunchProperty $metadata 'runnerPath' $process.RunnerPath
+            $priorAgentStatus = @($issue.Labels | Where-Object { $_ -in @('agent:done', 'agent:needs-human', 'agent:failed') } | Select-Object -First 1)
+            if ($priorAgentStatus.Count -gt 0) { Set-LaunchProperty $metadata 'previousAgentStatus' ([string]$priorAgentStatus[0]).Substring(6) }
             $state.launches = @($state.launches) + @($metadata); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
             Write-LaunchEvent 'running' $issue ('Started tracked PID ' + $metadata.pid + '.')
             [void](Invoke-LaunchLabelTransition $issue $metadata $Config 'running' $GitHubToken); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
-        } catch { Write-LaunchEvent 'failed' $issue $_.Exception.Message }
+        } catch {
+            $launchFailure = $_.Exception.Message
+            Write-LaunchEvent 'failed' $issue $launchFailure
+            if (-not $WhatIf) {
+                try { Request-IssueLaunchAgentLabel -Issue $issue -Launch $Config.Launch -Status 'failed' -CurrentAgentStatus 'run' -GitHubToken $GitHubToken | Out-Null }
+                catch { Write-LaunchEvent 'failed' $issue ('GitHub failure label update failed: ' + $_.Exception.Message) }
+            }
+        }
     }
 }
 function Invoke-MonitorIteration {

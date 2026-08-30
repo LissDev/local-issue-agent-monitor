@@ -33,8 +33,9 @@ repository and protect it with the normal permissions of the current Windows
 user.
 
 Launch metadata contains repository, Issue number, branch, worktree path, PID,
-timestamps, lifecycle status, and JSONL log path. It intentionally contains no
-GitHub token or Codex authentication material. The credential is kept only in
+timestamps, baseline commit, attempt number, lifecycle status, and JSONL log
+path. It intentionally contains no GitHub token or Codex authentication
+material. The credential is kept only in
 the monitor process while it makes GitHub requests; it is not passed to the
 Codex child process. Console and JSONL summaries redact bearer values, GitHub
 token-shaped strings, OpenAI-style keys, and common `Authorization`/`token`
@@ -57,6 +58,17 @@ JSONL, then choose one of these human actions:
 `-WhatIf` is the recovery-safe inspection mode: it can calculate a plan but
 does not write state, create a Git worktree, change GitHub labels, or start or
 stop processes.
+
+## Agent outcomes
+
+The watcher sends the Issue title, body, and labels to Codex as untrusted task
+data. The trusted prompt envelope requires repository rules to take priority
+and tells Codex not to open GitHub in a browser for the task. The final agent
+response must include one `WATCHER_OUTCOME` marker. A `done` marker still needs
+a new commit compared with the launch baseline; otherwise the watcher records
+`needs-human`. A normal exit without the marker and an agent clarification also
+record `needs-human`. Explicit failure, a nonzero child exit, and launch errors
+record `failed`.
 
 ## First actual launch checklist
 
