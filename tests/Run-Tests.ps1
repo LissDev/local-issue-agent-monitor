@@ -236,7 +236,8 @@ try {
     Assert-True ($plan.Prompt -match 'agent:run' -and $plan.Prompt -match 'priority:high' -and $plan.Prompt -match 'status:ready' -and $plan.Prompt -match 'type:feat') 'Prompt includes normalized Issue labels as task data'
     Assert-True ($plan.Prompt -match 'takes priority over all Issue task data') 'Prompt gives watcher instructions priority over Issue task data'
     Assert-True ($plan.Prompt -match 'Do not open GitHub in a browser') 'Prompt makes browser reading unnecessary'
-    Assert-True ($plan.Prompt -match 'WATCHER_OUTCOME: done') 'Prompt requires a machine-readable final outcome'
+    Assert-True ($plan.Prompt -match 'WATCHER_OUTCOME: commit-request') 'Prompt requires the watcher-side commit-request outcome'
+    Assert-True ($plan.Prompt -match 'Do not create a Git commit yourself') 'Prompt keeps Git metadata writes out of the agent process'
     Assert-True ($plan.Prompt -notmatch [regex]::Escape($testToken)) 'The GitHub token is never included in the agent prompt'
     Assert-True ($plan.Prompt -match 'read AGENTS\.md') 'Prompt requires the agent to read repository rules before edits'
     Assert-Equal $plan.BaseCommit '1111111111111111111111111111111111111111' 'Launch plan records the verified baseline commit'
@@ -266,15 +267,12 @@ try {
     Assert-True ($coreSource -match 'function Protect-LaunchLogLine') 'The generated runner redacts credential-shaped JSONL values before writing its external log'
     Assert-True ($coreSource -match '\[Console\]::OutputEncoding' -and $coreSource -match '\$OutputEncoding') 'The generated runner reads Codex output as UTF-8 before writing JSONL'
     Assert-True ($coreSource -match "EnvironmentVariables.Remove\('GITHUB_ISSUES_TOKEN'\)") 'The generated child process explicitly removes the GitHub token environment variable'
+    Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The generated child process uses the workspace-write sandbox'
     $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
     Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
     Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'
     Assert-Equal $metadata.attempt 1 'First launch metadata records attempt one'
     Assert-Equal $metadata.baseCommit '1111111111111111111111111111111111111111' 'Launch metadata records no secret and retains the baseline commit'
-    $sameCommit = Test-IssueLaunchHasNewCommit -LaunchMetadata $metadata -GitScript { param($RepositoryPath, $Arguments) @('1111111111111111111111111111111111111111') }
-    Assert-True (-not $sameCommit.HasNewCommit) 'A done marker without a new commit cannot become agent:done'
-    $newCommit = Test-IssueLaunchHasNewCommit -LaunchMetadata $metadata -GitScript { param($RepositoryPath, $Arguments) @('2222222222222222222222222222222222222222') }
-    Assert-True $newCommit.HasNewCommit 'A distinct Issue-branch commit satisfies the done commit gate'
     $retryLaunch = [pscustomobject]@{ repository = $launchIssue.Repository; issueNumber = $launchIssue.Number; status = 'needs-human' }
     $retryPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit -PriorLaunches @($retryLaunch)
     Assert-Equal $retryPlan.Attempt 2 'A completed or needs-human launch creates a new attempt after agent:run is added again'
@@ -349,6 +347,37 @@ try {
     Assert-True $fixtureWorktree.Created 'A disposable local Git repository gets an isolated worktree'
     Assert-True (Test-Path -LiteralPath (Join-Path $fixtureWorktree.Path '.git')) 'The disposable worktree is a Git checkout'
     Assert-Equal (& git -C $fixtureWorktree.Path branch --show-current) $fixturePlan.Branch 'The disposable worktree uses the exact computed branch'
+    $fixtureMetadata = New-IssueLaunchMetadata -Plan $fixturePlan -ProcessId 901 -LogPath (Join-Path $temporaryRoot 'fixture-success.jsonl')
+    [IO.File]::WriteAllText((Join-Path $fixtureWorktree.Path 'watcher-success.txt'), 'watcher commits this change')
+    $successfulCommit = Invoke-IssueLaunchCommitRequest -LaunchMetadata $fixtureMetadata
+    Assert-True $successfulCommit.Committed 'A commit-request creates one local commit in the tracked Issue worktree'
+    Assert-True ($successfulCommit.Commit -ne $fixturePlan.BaseCommit) 'The watcher-side commit differs from the stored launch baseline'
+    Assert-True ((& git -C $fixtureWorktree.Path log -1 --pretty=%s) -match 'Issue #77: watcher-side local commit') 'The watcher creates the expected local commit message'
+
+    $emptyPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $fixtureLaunch -PriorLaunches @($fixtureMetadata)
+    $emptyWorktree = New-IssueLaunchWorktree -Plan $emptyPlan -Launch $fixtureLaunch
+    $emptyMetadata = New-IssueLaunchMetadata -Plan $emptyPlan -ProcessId 902 -LogPath (Join-Path $temporaryRoot 'fixture-empty.jsonl')
+    $emptyCommit = Invoke-IssueLaunchCommitRequest -LaunchMetadata $emptyMetadata
+    Assert-True (-not $emptyCommit.Committed) 'An empty commit-request never creates a local commit'
+    Assert-True ($emptyCommit.Message -match 'no worktree diff') 'An empty commit-request has a recoverable diagnostic'
+
+    $changedBranchPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $fixtureLaunch -PriorLaunches @($fixtureMetadata, $emptyMetadata)
+    $changedBranchWorktree = New-IssueLaunchWorktree -Plan $changedBranchPlan -Launch $fixtureLaunch
+    $changedBranchMetadata = New-IssueLaunchMetadata -Plan $changedBranchPlan -ProcessId 903 -LogPath (Join-Path $temporaryRoot 'fixture-branch.jsonl')
+    [IO.File]::WriteAllText((Join-Path $changedBranchWorktree.Path 'changed-branch.txt'), 'must not commit')
+    & git -C $changedBranchWorktree.Path checkout --quiet -b unexpected-test-branch
+    $changedBranchCommit = Invoke-IssueLaunchCommitRequest -LaunchMetadata $changedBranchMetadata
+    Assert-True (-not $changedBranchCommit.Committed) 'A changed worktree branch never receives a watcher-side commit'
+    Assert-True ($changedBranchCommit.Message -match 'not registered on expected branch') 'A changed branch has a recoverable diagnostic'
+
+    $failedCommitPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $fixtureLaunch -PriorLaunches @($fixtureMetadata, $emptyMetadata, $changedBranchMetadata)
+    $failedCommitWorktree = New-IssueLaunchWorktree -Plan $failedCommitPlan -Launch $fixtureLaunch
+    $failedCommitMetadata = New-IssueLaunchMetadata -Plan $failedCommitPlan -ProcessId 904 -LogPath (Join-Path $temporaryRoot 'fixture-failed.jsonl')
+    [IO.File]::WriteAllText((Join-Path $failedCommitWorktree.Path 'failed-commit.txt'), 'commit failure fixture')
+    $failedCommit = Invoke-IssueLaunchCommitRequest -LaunchMetadata $failedCommitMetadata -CommitScript { param($WorktreePath, $Message) throw 'fixture commit rejected' }
+    Assert-True (-not $failedCommit.Committed) 'A failed watcher-side commit does not report success'
+    Assert-True ($failedCommit.Message -match 'fixture commit rejected') 'A failed watcher-side commit has a recoverable diagnostic'
+    Assert-Equal (& git -C $failedCommitWorktree.Path rev-parse HEAD) $failedCommitPlan.BaseCommit 'A failed watcher-side commit leaves the launch baseline at HEAD'
 
     $readOnlyStatePath = Join-Path $temporaryRoot 'read-only-poll.json'
     Invoke-IssueMonitorPoll -Config $emptyPollConfig -GitHubToken $testToken -StatePath $readOnlyStatePath -DoNotSaveState -InvokeRestMethodScript {
@@ -477,8 +506,8 @@ try {
     Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
     Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
     $script:IsActivityMonitor = $false; $script:ActivityMonitorCompletedIssueKeys.Clear()
-    [IO.File]::WriteAllText($jsonlFixture, '{"type":"item.completed","item":{"type":"agent_message","text":"Implementation complete. WATCHER_OUTCOME: done"}}' + "`n" + '{"type":"watcher-runner-exit","exitCode":0}')
-    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'done' 'Only an explicit done marker maps to done before the commit gate'
+    [IO.File]::WriteAllText($jsonlFixture, '{"type":"item.completed","item":{"type":"agent_message","text":"Implementation complete. WATCHER_OUTCOME: commit-request"}}' + "`n" + '{"type":"watcher-runner-exit","exitCode":0}')
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'commit-request' 'Only an explicit commit-request marker asks the watcher to create a commit'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"completed`"}`n{`"type`":`"watcher-runner-exit`",`"exitCode`":0}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'needs-human' 'Normal process completion without an outcome marker never maps to done'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"Please provide clarification about the expected behavior.`"}")

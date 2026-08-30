@@ -145,7 +145,7 @@ function Get-LaunchJsonlStatus {
         $candidateActivity = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText }
         if (-not [string]::IsNullOrWhiteSpace($safeAgentText)) { $hasUsableActivity = $true }
         if ($hasUsableActivity -and -not [string]::IsNullOrWhiteSpace($candidateActivity)) { $latestActivity = Get-DisplayText $candidateActivity 120 }
-        $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(done|needs-human|failed)\b')
+        $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(commit-request|needs-human|failed)\b')
         if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
         if ($safeText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required' -or $safeAgentText -match '(?i)need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
             $requestedHuman = $true; if ([string]::IsNullOrWhiteSpace($detail)) { $detail = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText } }
@@ -449,11 +449,22 @@ function Invoke-LaunchMonitoring {
         }
         $jsonl = Get-LaunchJsonlStatus $launch
         if ($jsonl.Status -ne 'running') {
+            # A final response can reach JSONL shortly before its runner-exit
+            # record. Never stage or commit while the agent process is still
+            # active, even when it has already requested a local commit.
+            if ($jsonl.Status -eq 'commit-request' -and -not $jsonl.ProcessExited) { continue }
             $terminalStatus = [string]$jsonl.Status
             $terminalDetail = [string]$jsonl.Detail
-            if ($terminalStatus -eq 'done') {
-                $commitCheck = Test-IssueLaunchHasNewCommit -LaunchMetadata $launch
-                if (-not $commitCheck.HasNewCommit) { $terminalStatus = 'needs-human'; $terminalDetail = $commitCheck.Message }
+            if ($terminalStatus -eq 'commit-request') {
+                $commitResult = Invoke-IssueLaunchCommitRequest -LaunchMetadata $launch
+                if ($commitResult.Committed) {
+                    $terminalStatus = 'done'
+                    $terminalDetail = 'Watcher created local commit ' + $commitResult.Commit + ' after validating the tracked launch.'
+                }
+                else {
+                    $terminalStatus = 'needs-human'
+                    $terminalDetail = $commitResult.Message
+                }
             }
             Set-LaunchProperty $launch 'status' $terminalStatus; $stateChanged = $true
             if ($terminalStatus -eq 'done') { Add-ActivityMonitorCompletedIssue $keyIssue }
