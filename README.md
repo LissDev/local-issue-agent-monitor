@@ -143,6 +143,14 @@ without a valid marker becomes `agent:needs-human`; an explicit `failed` marker,
 nonzero Codex exit, or launch error becomes `agent:failed`. A GitHub label
 failure is reported but does not stop or delete the local process.
 
+An agent that needs a decision must put one sanitized
+`WATCHER_HUMAN_REQUEST: <question>` line before
+`WATCHER_OUTCOME: needs-human`. The agent never receives the Issue token or
+posts directly to GitHub. On that explicit outcome, the watcher adds exactly one
+`[Agent status update]` Issue comment saying that the text was prepared by the
+agent and published by the watcher. Incidental activity text mentioning
+`needs-human` does not change the launch status or create a comment.
+
 See [security and recovery guidance](docs/SECURITY_AND_RECOVERY.md) for token,
 log, and first-run details.
 

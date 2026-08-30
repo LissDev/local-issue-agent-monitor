@@ -112,8 +112,8 @@ function Write-LaunchEvent {
 
 function Get-LaunchJsonlStatus {
     param([Parameter(Mandatory)]$Launch)
-    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false } }
-    $marker = $null; $detail = ''; $latestActivity = ''; $requestedHuman = $false; $runnerExitCode = $null
+    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' } }
+    $marker = $null; $detail = ''; $latestActivity = ''; $humanRequest = ''; $runnerExitCode = $null
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         $text = [string]$line
@@ -152,16 +152,18 @@ function Get-LaunchJsonlStatus {
         if ($hasUsableActivity -and -not [string]::IsNullOrWhiteSpace($candidateActivity)) { $latestActivity = Get-DisplayText $candidateActivity 120 }
         $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(commit-request|needs-human|failed)\b')
         if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
-        if ($humanInterventionEvent -or $safeAgentText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required|need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
-            $requestedHuman = $true; if ([string]::IsNullOrWhiteSpace($detail)) { $detail = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText } }
+        $requestMatches = [regex]::Matches($safeAgentText, '(?im)^\s*WATCHER_HUMAN_REQUEST\s*:\s*(?<request>\S[^\r\n]*)\s*$')
+        if ($requestMatches.Count -gt 0) {
+            $candidate = $requestMatches[$requestMatches.Count - 1].Groups['request'].Value -replace '\s+', ' '
+            $candidate = $candidate -replace '(?i)(?:[A-Z]:\\|\\\\)[^\s,;]+', '[local path redacted]'
+            $humanRequest = Get-DisplayText (Protect-MonitorText $candidate) 600
         }
     }
     $lastActivityAt = (Get-Item -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString('u')
-    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true } }
-    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode) } }
-    if ($requestedHuman) { return [pscustomobject]@{ Status = 'needs-human'; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = ($null -ne $runnerExitCode) } }
-    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true } }
-    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false }
+    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true; HumanRequest = '' } }
+    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode); HumanRequest = if ($marker -eq 'needs-human') { $humanRequest } else { '' } } }
+    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true; HumanRequest = '' } }
+    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' }
 }
 
 function Get-ActivityMonitorRows {
@@ -416,6 +418,24 @@ function Invoke-StopTrackedIssue {
     Write-LaunchEvent 'interrupted' $issue "Stopped only tracked PID $($launch.pid); branch, worktree, logs, and results were preserved."
 }
 
+function Publish-LaunchHumanRequestComment {
+    param([Parameter(Mandatory)]$Issue, [Parameter(Mandatory)]$Launch, [Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$GitHubToken, [scriptblock]$CommentRequestScript)
+    $request = if ($null -ne $Launch.PSObject.Properties['humanRequest']) { [string]$Launch.humanRequest } else { '' }
+    $alreadyPublished = $null -ne $Launch.PSObject.Properties['humanRequestCommentedAt'] -and -not [string]::IsNullOrWhiteSpace([string]$Launch.humanRequestCommentedAt)
+    if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or $alreadyPublished -or [string]::IsNullOrWhiteSpace($request)) { return $false }
+    $comment = "[Agent status update]`n`nPrepared by the agent and published by the watcher:`n$request"
+    try {
+        if ($null -ne $CommentRequestScript) { & $CommentRequestScript -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -Body $comment -GitHubToken $GitHubToken }
+        else { Invoke-GitHubIssueCommentCreate -Repository $Issue.Repository -IssueNumber ([int]$Issue.Number) -Body $comment -GitHubToken $GitHubToken | Out-Null }
+        Set-LaunchProperty $Launch 'humanRequestCommentedAt' ([DateTimeOffset]::UtcNow.ToString('o'))
+        return $true
+    }
+    catch {
+        Write-LaunchEvent 'needs-human' $Issue ('GitHub status comment failed; it will be retried: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
 function Invoke-LaunchMonitoring {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$PollResult, [Parameter(Mandatory)][string]$GitHubToken)
     if (-not [bool]$Config.Launch.Enabled) {
@@ -443,6 +463,9 @@ function Invoke-LaunchMonitoring {
                 $isExplicitRetry = $null -ne $currentIssue -and @($currentIssue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0 -and ([string]$launch.status -in @('done', 'needs-human'))
                 if ($currentLabelStatus -ne [string]$launch.status -and -not $isExplicitRetry) {
                     if (Invoke-LaunchLabelTransition $keyIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
+                }
+                if ([string]$launch.status -eq 'needs-human') {
+                    if (Publish-LaunchHumanRequestComment $keyIssue $launch $Config $GitHubToken) { $stateChanged = $true }
                 }
             }
             continue
@@ -472,9 +495,15 @@ function Invoke-LaunchMonitoring {
                 }
             }
             Set-LaunchProperty $launch 'status' $terminalStatus; $stateChanged = $true
+            if ($terminalStatus -eq 'needs-human' -and -not [string]::IsNullOrWhiteSpace([string]$jsonl.HumanRequest)) {
+                Set-LaunchProperty $launch 'humanRequest' ([string]$jsonl.HumanRequest)
+            }
             if ($terminalStatus -eq 'done') { Add-ActivityMonitorCompletedIssue $keyIssue }
             Write-LaunchEvent $terminalStatus $keyIssue $terminalDetail
             if ($terminalStatus -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $terminalStatus $GitHubToken) { $stateChanged = $true } }
+            if ($terminalStatus -eq 'needs-human') {
+                if (Publish-LaunchHumanRequestComment $keyIssue $launch $Config $GitHubToken) { $stateChanged = $true }
+            }
         }
     }
     # A completed child can disappear before the next poll.  Parse its JSONL

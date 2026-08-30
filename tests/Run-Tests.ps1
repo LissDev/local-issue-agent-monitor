@@ -238,6 +238,8 @@ try {
     Assert-True ($plan.Prompt -match 'Do not open GitHub in a browser') 'Prompt makes browser reading unnecessary'
     Assert-True ($plan.Prompt -match 'WATCHER_OUTCOME: commit-request') 'Prompt requires the watcher-side commit-request outcome'
     Assert-True ($plan.Prompt -match 'Do not create a Git commit yourself') 'Prompt keeps Git metadata writes out of the agent process'
+    Assert-True ($plan.Prompt -match 'WATCHER_HUMAN_REQUEST') 'Prompt requires a sanitized watcher-side human request'
+    Assert-True ($plan.Prompt -match 'Do not try to publish Issue comments yourself') 'Prompt keeps GitHub comment publication out of the agent process'
     Assert-True ($plan.Prompt -notmatch [regex]::Escape($testToken)) 'The GitHub token is never included in the agent prompt'
     Assert-True ($plan.Prompt -match 'read AGENTS\.md') 'Prompt requires the agent to read repository rules before edits'
     Assert-Equal $plan.BaseCommit '1111111111111111111111111111111111111111' 'Launch plan records the verified baseline commit'
@@ -326,6 +328,16 @@ try {
     Assert-True $directLabel.Requested 'Production label transition runs in the Core module without a script callback'
     Assert-Equal $script:labelHttpCalls 2 'Credential token authorizes both label API requests'
     Assert-Equal $script:labelAuthorization ('Bearer ' + $testToken) 'Credential token authorizes agent label updates'
+    $script:commentHttpCalls = 0
+    $commentHttpRequest = {
+        param($Uri, $Headers, $Method, $Body)
+        $script:commentHttpCalls++; $script:commentRequestUri = [string]$Uri; $script:commentRequestBody = [string]$Body
+        [pscustomobject]@{}
+    }
+    Invoke-GitHubIssueCommentCreate -Repository $launchIssue.Repository -IssueNumber $launchIssue.Number -Body '[Agent status update] request' -GitHubToken $testToken -InvokeRestMethodScript $commentHttpRequest
+    Assert-Equal $script:commentHttpCalls 1 'Credential token authorizes one Issue comment request'
+    Assert-True ($script:commentRequestUri -match '/issues/77/comments$') 'Issue comments use the GitHub Issue comments endpoint'
+    Assert-True ($script:commentRequestBody -match 'Agent status update') 'Issue comment payload contains the attributed status message'
 
     # The real Git fixture is entirely under the temporary test directory.  It
     # verifies that a clean local repository receives a genuinely isolated
@@ -397,6 +409,18 @@ try {
     }
     [IO.File]::WriteAllText($cliConfigPath, ($cliConfig | ConvertTo-Json -Depth 5))
     . (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $cliConfigPath -WhatIf
+    $WhatIf = $false
+    $script:publishedHumanRequests = 0
+    $commentLaunch = [pscustomobject]@{ humanRequest = 'Please choose the supported credential provider.' }
+    $commentIssue = [pscustomobject]@{ Repository = 'example-org/example-repo'; Number = 77 }
+    $commentConfig = [pscustomobject]@{ Launch = [pscustomobject]@{ Enabled = $true } }
+    $publishRequest = { param($Repository, $IssueNumber, $Body, $GitHubToken) $script:publishedHumanRequests++; $script:publishedHumanRequestBody = $Body }
+    Assert-True (Publish-LaunchHumanRequestComment $commentIssue $commentLaunch $commentConfig $testToken $publishRequest) 'An explicit human request is published by the watcher'
+    Assert-Equal $script:publishedHumanRequests 1 'The watcher publishes the human request once'
+    Assert-True ($script:publishedHumanRequestBody -match '^\[Agent status update\]') 'Published requests are marked as agent status updates'
+    Assert-True ($script:publishedHumanRequestBody -match 'published by the watcher') 'Published requests identify the watcher as publisher'
+    Assert-True (-not (Publish-LaunchHumanRequestComment $commentIssue $commentLaunch $commentConfig $testToken $publishRequest)) 'A later poll does not duplicate the human request comment'
+    Assert-Equal $script:publishedHumanRequests 1 'Duplicate-poll protection avoids a second Issue comment'
 
     # Follow is a strictly local reader: a fresh, identity-verified heartbeat
     # exposes watcher metadata and launch/log activity without calling GitHub or
@@ -469,7 +493,7 @@ try {
     $jsonlFixture = Join-Path $temporaryRoot 'render.jsonl'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
     $rendered = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
-    Assert-Equal $rendered.Status 'needs-human' 'JSONL maps a human intervention event to needs-human'
+    Assert-Equal $rendered.Status 'running' 'A non-agent needs-human event does not change launch status'
     Assert-True ($rendered.Detail -notmatch 'github_pat_secret_value') 'JSONL credentials are redacted before display'
     Assert-True ($rendered.Activity -notmatch 'github_pat_secret_value') 'Latest JSONL activity is redacted before display'
     $utf8Activity = -join @([char]0x0410, [char]0x0433, [char]0x0435, [char]0x043d, [char]0x0442, [char]0x0020, [char]0x0432, [char]0x044b, [char]0x043f, [char]0x043e, [char]0x043b, [char]0x043d, [char]0x044f, [char]0x0435, [char]0x0442, [char]0x0020, [char]0x043f, [char]0x0440, [char]0x043e, [char]0x0432, [char]0x0435, [char]0x0440, [char]0x043a, [char]0x0443)
@@ -522,8 +546,12 @@ try {
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'commit-request' 'Only an explicit commit-request marker asks the watcher to create a commit'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"completed`"}`n{`"type`":`"watcher-runner-exit`",`"exitCode`":0}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'needs-human' 'Normal process completion without an outcome marker never maps to done'
-    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"Please provide clarification about the expected behavior.`"}")
-    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'needs-human' 'A clarification request maps to needs-human'
+    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"A later step may return needs-human.`"}")
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'running' 'An incidental needs-human mention does not change launch status'
+    [IO.File]::WriteAllText($jsonlFixture, '{"type":"agent_message","message":"WATCHER_HUMAN_REQUEST: Please choose a credential provider.\nWATCHER_OUTCOME: needs-human"}')
+    $explicitHumanRequest = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
+    Assert-Equal $explicitHumanRequest.Status 'needs-human' 'An explicit human request with outcome marker maps to needs-human'
+    Assert-Equal $explicitHumanRequest.HumanRequest 'Please choose a credential provider.' 'Only the explicit sanitized human request is retained'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"WATCHER_OUTCOME: failed`"}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'failed' 'An explicit failed marker maps to failed'
     [IO.File]::WriteAllText($jsonlFixture, '{"type":"watcher-runner-exit","exitCode":1}')
