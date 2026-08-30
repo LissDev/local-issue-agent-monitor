@@ -225,6 +225,12 @@ without printing credentials. A process that has disappeared becomes `interrupte
 restarted automatically.  Inspect the preserved worktree and log, then decide
 whether to continue manually or create a new Issue/launch request.
 
+After a pull request has been merged and its Issue closed, the integration
+coordinator should remove the now-unused local worktree and branch. Verify the
+merged PR, closed Issue, exited process, and clean worktree first. This cleanup
+is deliberately not performed by the agent or watcher, so a failed,
+needs-human, or unmerged result remains recoverable.
+
 On a successful actual start the monitor changes `agent:run` to `agent:running`.
 The agent must finish its response with exactly one marker:
 `WATCHER_OUTCOME: commit-request`, `WATCHER_OUTCOME: needs-human`, or

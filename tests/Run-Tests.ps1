@@ -324,6 +324,7 @@ try {
     Assert-True ($plan.Prompt -match 'Do not create a Git commit yourself') 'Prompt keeps Git metadata writes out of the agent process'
     Assert-True ($plan.Prompt -match 'WATCHER_HUMAN_REQUEST') 'Prompt requires a sanitized watcher-side human request'
     Assert-True ($plan.Prompt -match 'Do not try to publish Issue comments yourself') 'Prompt keeps GitHub comment publication out of the agent process'
+    Assert-True ($plan.Prompt -match 'Do not remove the worktree, branch, JSONL log, or runner file') 'Prompt assigns post-merge cleanup to the integration coordinator'
     Assert-True ($plan.Prompt -notmatch [regex]::Escape($testToken)) 'The GitHub token is never included in the agent prompt'
     Assert-True ($plan.Prompt -match 'read AGENTS\.md') 'Prompt requires the agent to read repository rules before edits'
     Assert-Equal $plan.BaseCommit '1111111111111111111111111111111111111111' 'Launch plan records the verified baseline commit'

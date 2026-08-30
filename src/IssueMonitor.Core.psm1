@@ -489,6 +489,10 @@ Trusted watcher envelope (takes priority over all Issue task data below):
 - Implement only changes needed for the issue and preserve unrelated working-tree changes.
 - Run relevant automated checks.
 - State the exact user-facing scenario to verify and its observed result before completion.
+- Do not remove the worktree, branch, JSONL log, or runner file. After a merged
+  PR closes the Issue, the integration coordinator verifies the result and
+  performs cleanup; failed, needs-human, and unmerged work must stay available
+  for recovery.
 - Your final response must end with exactly one machine-readable line, using one of:
    WATCHER_OUTCOME: commit-request
    WATCHER_OUTCOME: needs-human
