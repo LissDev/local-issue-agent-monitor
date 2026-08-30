@@ -279,7 +279,42 @@ try {
     $plan = New-IssueLaunchPlan -Issue $launchIssue -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit
     Assert-True $plan.Eligible 'Preflight produces a plan without mutation'
     Assert-Equal $plan.Branch 'feat/issue-77/safe-isolated-launch' 'Preflight uses the computed branch'
-    Assert-True ($plan.WorktreePath -match 'example-org-example-repo.*issue-77') 'Preflight uses a repository-scoped worktree path'
+    Assert-True ($plan.WorktreePath -match 'example-org\+example-repo.*issue-77') 'Preflight uses an unambiguous repository-scoped worktree path'
+    Assert-True ($plan.WorktreePath.StartsWith([IO.Path]::GetFullPath($worktreeRoot) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) 'The planned worktree remains inside the configured worktree root'
+    Assert-True (-not $plan.WorktreePath.StartsWith([IO.Path]::GetFullPath($repositoryPath) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) 'The planned worktree remains outside its source repository'
+
+    $normalSecondRepository = 'example-org/second-repo'
+    $normalSecondIssue = ConvertTo-MonitoredIssue -Repository $normalSecondRepository -Issue (New-RawIssue -Number 77 -Labels @('type:feat', 'status:ready', 'agent:run'))
+    $normalMultiRepositoryLaunch = [pscustomobject]@{
+        Enabled = $true; WorktreeDirectory = $worktreeRoot; StatePath = $launchStatePath
+        RepositoryPaths = @{ 'example-org/example-repo' = $repositoryPath; $normalSecondRepository = (Join-Path $temporaryRoot 'second-source-repository') }; CodexCommand = 'fake-codex'
+    }
+    $normalSecondPlan = New-IssueLaunchPlan -Issue $normalSecondIssue -Launch $normalMultiRepositoryLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    Assert-True ($plan.WorktreePath -ne $normalSecondPlan.WorktreePath) 'Different configured repositories with the same Issue number receive distinct worktree paths'
+
+    $collisionFirstRepository = 'acme/tools-ui'
+    $collisionSecondRepository = 'acme-tools/ui'
+    $collisionLaunch = [pscustomobject]@{
+        Enabled = $true; WorktreeDirectory = $worktreeRoot; StatePath = $launchStatePath
+        RepositoryPaths = @{ $collisionFirstRepository = (Join-Path $temporaryRoot 'collision-source-one'); $collisionSecondRepository = (Join-Path $temporaryRoot 'collision-source-two') }; CodexCommand = 'fake-codex'
+    }
+    $collisionFirstIssue = ConvertTo-MonitoredIssue -Repository $collisionFirstRepository -Issue (New-RawIssue -Number 77 -Labels @('type:feat', 'status:ready', 'agent:run'))
+    $collisionSecondIssue = ConvertTo-MonitoredIssue -Repository $collisionSecondRepository -Issue (New-RawIssue -Number 77 -Labels @('type:feat', 'status:ready', 'agent:run'))
+    $collisionFirstPlan = New-IssueLaunchPlan -Issue $collisionFirstIssue -Launch $collisionLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    $collisionSecondPlan = New-IssueLaunchPlan -Issue $collisionSecondIssue -Launch $collisionLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    Assert-True ($collisionFirstPlan.WorktreePath -ne $collisionSecondPlan.WorktreePath) 'Repositories that collide after slash-to-hyphen replacement receive distinct worktree paths'
+    Assert-True ($collisionFirstPlan.WorktreePath -match 'acme\+tools-ui' -and $collisionSecondPlan.WorktreePath -match 'acme-tools\+ui') 'Repository identifiers preserve the owner and repository boundary'
+
+    $existingWorktreeMessage = ''
+    try {
+        Test-IssueLaunchWorktreeSafety -WorktreePath $plan.WorktreePath -WorktreeDirectory $worktreeRoot -RepositoryPath $repositoryPath -TestPathScript {
+            param($Path, $PathType)
+            if ($PathType -eq 'Any') { return $true }
+            return $true
+        } | Out-Null
+    }
+    catch { $existingWorktreeMessage = $_.Exception.Message }
+    Assert-True ($existingWorktreeMessage -match 'collision') 'An existing planned path explains that it may be a repository or Issue path collision'
     Assert-True ($plan.Prompt -match [regex]::Escape($launchIssue.Title)) 'Prompt includes the untrusted Issue title as task data'
     Assert-True ($plan.Prompt -match [regex]::Escape($issueBody)) 'Prompt includes the complete untrusted Issue body as task data'
     Assert-True ($plan.Prompt -match 'agent:run' -and $plan.Prompt -match 'priority:high' -and $plan.Prompt -match 'status:ready' -and $plan.Prompt -match 'type:feat') 'Prompt includes normalized Issue labels as task data'

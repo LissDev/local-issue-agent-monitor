@@ -336,6 +336,15 @@ function Resolve-IssueLaunchRepositoryTarget {
     return [pscustomobject]@{ Repository = $Repository; LocalPath = $path }
 }
 
+function ConvertTo-IssueLaunchRepositoryIdentifier {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository)
+
+    # GitHub owner and repository names cannot contain '+', so this preserves
+    # their boundary without flattening distinct identities into one directory.
+    return ($Repository -replace '/', '+')
+}
+
 function Test-IssueLaunchWorktreeSafety {
     [CmdletBinding()]
     param(
@@ -360,7 +369,9 @@ function Test-IssueLaunchWorktreeSafety {
     $rootExists = if ($null -ne $TestPathScript) { & $TestPathScript -Path $root -PathType Container } else { Test-Path -LiteralPath $root -PathType Container }
     if (-not $rootExists) { throw "Configured worktreeDirectory '$root' does not exist." }
     $exists = if ($null -ne $TestPathScript) { & $TestPathScript -Path $candidate -PathType Any } else { Test-Path -LiteralPath $candidate }
-    if ($exists) { throw "Worktree path '$candidate' already exists and will never be reused or deleted by the monitor." }
+    if ($exists) {
+        throw "Worktree path '$candidate' already exists; this may be a repository or Issue path collision. The monitor will never reuse or delete it."
+    }
     if ($null -ne $GitScript -or -not [string]::IsNullOrWhiteSpace($RepositoryPath)) {
         $knownWorktrees = if ($null -eq $GitScript) {
             & git -C $RepositoryPath worktree list --porcelain
@@ -373,7 +384,9 @@ function Test-IssueLaunchWorktreeSafety {
             @(& $GitScript -RepositoryPath $RepositoryPath -Arguments @('worktree', 'list', '--porcelain'))
         }
         foreach ($line in $knownWorktrees) {
-            if ([string]$line -eq ('worktree ' + $candidate)) { throw "Worktree '$candidate' is already registered by Git." }
+            if ([string]$line -eq ('worktree ' + $candidate)) {
+                throw "Worktree '$candidate' is already registered by Git; this may be a repository or Issue path collision."
+            }
         }
     }
     return $true
@@ -528,7 +541,7 @@ function New-IssueLaunchPlan {
     $priorAttempts = @($PriorLaunches | Where-Object { $null -ne $_ -and [string]$_.repository -eq [string]$Issue.Repository -and [int]$_.issueNumber -eq [int]$Issue.Number }).Count
     $attempt = $priorAttempts + 1
     $branch = New-IssueLaunchBranch -Type $eligibility.Type -IssueNumber $Issue.Number -ShortName $Issue.Title -Attempt $attempt
-    $repositoryToken = ([string]$Issue.Repository -replace '[^A-Za-z0-9_.-]+', '-')
+    $repositoryToken = ConvertTo-IssueLaunchRepositoryIdentifier -Repository $Issue.Repository
     $worktreeLeaf = 'issue-' + [int]$Issue.Number
     if ($attempt -gt 1) { $worktreeLeaf += ('-attempt-' + $attempt) }
     $worktreePath = Join-Path -Path $Launch.WorktreeDirectory -ChildPath (Join-Path -Path $repositoryToken -ChildPath $worktreeLeaf)
