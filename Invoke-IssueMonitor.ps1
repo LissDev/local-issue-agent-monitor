@@ -116,53 +116,30 @@ function Get-LaunchJsonlStatus {
     $marker = $null; $detail = ''; $latestActivity = ''; $humanRequest = ''; $runnerExitCode = $null
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
-        $text = [string]$line
-        $agentText = ''; $hasUsableActivity = $false; $humanInterventionEvent = $false
         try {
-            $json = $text | ConvertFrom-Json -ErrorAction Stop; $parts = @()
-            foreach ($name in @('type', 'event', 'status', 'message', 'error', 'output')) {
-                if ($null -ne $json.PSObject.Properties[$name]) {
-                    $parts += [string]$json.$name
-                    if ($name -in @('message', 'error', 'output') -and -not [string]::IsNullOrWhiteSpace([string]$json.$name)) { $hasUsableActivity = $true }
-                    if ($name -in @('type', 'event', 'status') -and [string]$json.$name -match '^(?i:needs[-_ ]?human|human[-_ ]?input|approval[-_ ]?required)$') { $humanInterventionEvent = $true }
+            $json = ([string]$line | ConvertFrom-Json -ErrorAction Stop)
+            if ([int]$json.version -ne 1 -or [string]$json.type -ne 'watcher-agent-event') { continue }
+            $event = [string]$json.event
+            if ($event -eq 'activity' -and $null -ne $json.PSObject.Properties['message']) { $latestActivity = Get-DisplayText (Protect-MonitorText ([string]$json.message)) 120 }
+            if ($event -eq 'outcome' -and $null -ne $json.PSObject.Properties['outcome']) {
+                $candidateOutcome = [string]$json.outcome
+                if ($candidateOutcome -in @('commit-request', 'needs-human', 'failed')) {
+                    $marker = $candidateOutcome; $detail = if ($null -ne $json.PSObject.Properties['message']) { Protect-MonitorText ([string]$json.message) } else { '' }
+                    if ($candidateOutcome -eq 'needs-human' -and $null -ne $json.PSObject.Properties['humanRequest']) {
+                        $candidateRequest = ([string]$json.humanRequest -replace '\s+', ' ') -replace '(?i)(?:[A-Z]:\\|\\\\)[^\s,;]+', '[local path redacted]'
+                        $humanRequest = Get-DisplayText (Protect-MonitorText $candidateRequest) 600
+                    }
                 }
             }
-            if ($parts.Count -gt 0) { $text = $parts -join ' ' }
-            $item = if ($null -ne $json.PSObject.Properties['item']) { $json.item } else { $null }
-            if ($null -ne $item -and $null -ne $item.PSObject.Properties['type'] -and [string]$item.type -eq 'agent_message') {
-                foreach ($name in @('text', 'message', 'output')) { if ($null -ne $item.PSObject.Properties[$name]) { $agentText += [string]$item.$name } }
-            }
-            elseif ($null -ne $json.PSObject.Properties['type'] -and [string]$json.type -eq 'agent_message') {
-                foreach ($name in @('text', 'message', 'output')) { if ($null -ne $json.PSObject.Properties[$name]) { $agentText += [string]$json.$name } }
-            }
-            if ($null -ne $json.PSObject.Properties['type'] -and [string]$json.type -eq 'watcher-runner-exit' -and $null -ne $json.PSObject.Properties['exitCode']) {
-                $parsedExitCode = 0
-                if ([int]::TryParse([string]$json.exitCode, [ref]$parsedExitCode)) { $runnerExitCode = $parsedExitCode }
-            }
+            if ($event -eq 'exit' -and $null -ne $json.PSObject.Properties['exitCode']) { $parsedExitCode = 0; if ([int]::TryParse([string]$json.exitCode, [ref]$parsedExitCode)) { $runnerExitCode = $parsedExitCode } }
         } catch {
-            # A writer can leave its current final JSONL record incomplete.
-            # Do not use raw, unparsed bytes for state or activity; the next
-            # poll will process this record after it becomes valid JSON.
             continue
-        }
-        $safeText = Protect-MonitorText $text
-        $safeAgentText = Protect-MonitorText $agentText
-        $candidateActivity = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText }
-        if (-not [string]::IsNullOrWhiteSpace($safeAgentText)) { $hasUsableActivity = $true }
-        if ($hasUsableActivity -and -not [string]::IsNullOrWhiteSpace($candidateActivity)) { $latestActivity = Get-DisplayText $candidateActivity 120 }
-        $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(commit-request|needs-human|failed)\b')
-        if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
-        $requestMatches = [regex]::Matches($safeAgentText, '(?im)^\s*WATCHER_HUMAN_REQUEST\s*:\s*(?<request>\S[^\r\n]*)\s*$')
-        if ($requestMatches.Count -gt 0) {
-            $candidate = $requestMatches[$requestMatches.Count - 1].Groups['request'].Value -replace '\s+', ' '
-            $candidate = $candidate -replace '(?i)(?:[A-Z]:\\|\\\\)[^\s,;]+', '[local path redacted]'
-            $humanRequest = Get-DisplayText (Protect-MonitorText $candidate) 600
         }
     }
     $lastActivityAt = (Get-Item -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString('u')
-    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true; HumanRequest = '' } }
+    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Agent runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true; HumanRequest = '' } }
     if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode); HumanRequest = if ($marker -eq 'needs-human') { $humanRequest } else { '' } } }
-    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true; HumanRequest = '' } }
+    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Agent runner exited without a valid terminal outcome.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true; HumanRequest = '' } }
     return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' }
 }
 
@@ -320,12 +297,11 @@ function Convert-JsonlLineToFollowText {
     $text = $Line
     try {
         $json = $Line | ConvertFrom-Json -ErrorAction Stop
-        $item = if ($null -ne $json.PSObject.Properties['item']) { $json.item } else { $null }
-        if ($null -ne $item -and [string]$item.type -eq 'agent_message' -and $null -ne $item.PSObject.Properties['text']) { $text = [string]$item.text }
+        if ([int]$json.version -ne 1 -or [string]$json.type -ne 'watcher-agent-event') { return '' }
+        if ([string]$json.event -eq 'outcome') { $text = 'terminal outcome: ' + [string]$json.outcome }
+        elseif ([string]$json.event -eq 'exit') { $text = 'runner exit: ' + [string]$json.exitCode }
         elseif ($null -ne $json.PSObject.Properties['message']) { $text = [string]$json.message }
-        elseif ($null -ne $json.PSObject.Properties['output']) { $text = [string]$json.output }
-        elseif ($null -ne $json.PSObject.Properties['error']) { $text = [string]$json.error }
-        elseif ($null -ne $json.PSObject.Properties['type']) { $text = [string]$json.type }
+        else { return '' }
     } catch { }
     return (Get-DisplayText (Protect-MonitorText $text) 180)
 }
@@ -340,7 +316,8 @@ function Get-FollowLogEvents {
         if ($lines.Count -lt $offset) { $offset = 0 }
         for ($index = $offset; $index -lt $lines.Count; $index++) {
             if (-not [string]::IsNullOrWhiteSpace([string]$lines[$index])) {
-                [void]$events.Add([pscustomobject]@{ Repository = [string]$launch.repository; Issue = [int]$launch.issueNumber; Text = (Convert-JsonlLineToFollowText ([string]$lines[$index])) })
+                $eventText = Convert-JsonlLineToFollowText ([string]$lines[$index])
+                if (-not [string]::IsNullOrWhiteSpace($eventText)) { [void]$events.Add([pscustomobject]@{ Repository = [string]$launch.repository; Issue = [int]$launch.issueNumber; Text = $eventText }) }
             }
         }
         $Cursors[$key] = $lines.Count
@@ -529,12 +506,14 @@ function Invoke-LaunchMonitoring {
         try {
             Write-LaunchEvent 'preflight' $issue 'Checking branch, base repository, and isolated worktree path.'
             $plan = New-IssueLaunchPlan -Issue $issue -Launch $Config.Launch -PriorLaunches $known
-            if ($WhatIf) { Write-LaunchEvent 'preflight' $issue ("WhatIf plan: branch={0}; worktree={1}; command={2} exec --json" -f $plan.Branch, $plan.WorktreePath, $Config.Launch.CodexCommand); continue }
-            if ($null -eq (Get-Command -Name $Config.Launch.CodexCommand -ErrorAction SilentlyContinue)) { throw "Configured Codex command '$($Config.Launch.CodexCommand)' was not found. No worktree was created." }
+            $runner = New-CodexIssueAgentRunner -Command $Config.Launch.CodexCommand
+            if ($WhatIf) { Write-LaunchEvent 'preflight' $issue ("WhatIf plan: branch={0}; worktree={1}; command={2}" -f $plan.Branch, $plan.WorktreePath, $runner.CommandDescription); continue }
+            Find-IssueAgentRunnerCommand -Runner $runner | Out-Null
             New-IssueLaunchWorktree -Plan $plan -Launch $Config.Launch | Out-Null
             $stateDirectory = Split-Path -Path $Config.Launch.StatePath -Parent; $logPath = Join-Path $stateDirectory ('issue-{0}-{1}.jsonl' -f $issue.Number, [Guid]::NewGuid().ToString('N'))
-            $process = Start-IssueLaunchProcess -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath -CodexCommand $Config.Launch.CodexCommand
-            $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $process.Id -LogPath $process.LogPath -ProcessStartedAt $process.StartedAt; Set-LaunchProperty $metadata 'runnerPath' $process.RunnerPath
+            $process = Start-IssueAgentRunner -Runner $runner -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath
+            $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $process.Id -LogPath $process.LogPath -ProcessStartedAt $process.StartedAt
+            Set-LaunchProperty $metadata 'runnerPath' $process.RunnerPath; Set-LaunchProperty $metadata 'runner' $runner.Name; Set-LaunchProperty $metadata 'runnerEventVersion' $runner.EventVersion
             $priorAgentStatus = @($issue.Labels | Where-Object { $_ -in @('agent:done', 'agent:needs-human', 'agent:failed') } | Select-Object -First 1)
             if ($priorAgentStatus.Count -gt 0) { Set-LaunchProperty $metadata 'previousAgentStatus' ([string]$priorAgentStatus[0]).Substring(6) }
             $state.launches = @($state.launches) + @($metadata); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath

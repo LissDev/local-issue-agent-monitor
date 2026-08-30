@@ -247,29 +247,40 @@ try {
     Assert-True $worktree.Created 'Fake Git receives a worktree creation request only after preflight'
     Assert-True (@($script:fakeGitCalls | Where-Object { $_ -match '^worktree add -b ' }).Count -eq 1) 'Exactly one fake worktree add is issued'
 
-    # The fake process seam stands in for codex exec --json.  It writes a JSONL
-    # fixture but never starts a real child process or external executable.
+    # The fake runner uses the public runner contract. It writes normalized
+    # JSONL but never starts a real child process or external executable.
     New-Item -ItemType Directory -Path $plan.WorktreePath -Force | Out-Null
     $stateDirectory = Split-Path -Path $launchStatePath -Parent
     $logPath = Join-Path $stateDirectory 'issue-77-fake.jsonl'
     $script:fakeRunnerCalls = 0
-    $fakeRunner = {
-        param($Prompt, $LogPath, $StateDirectory, $WorkingDirectory, $CodexCommand)
+    $codexRunner = New-CodexIssueAgentRunner -Command 'fake-codex'
+    Assert-Equal $codexRunner.Name 'codex' 'The built-in Codex adapter identifies its runner type'
+    Assert-Equal $codexRunner.EventVersion 1 'The built-in Codex adapter declares normalized event version one'
+    Assert-True ($codexRunner.CommandDescription -match '^fake-codex exec ' -and $codexRunner.CommandDescription -notmatch [regex]::Escape($plan.Prompt)) 'The Codex adapter constructs only runner arguments before prompt delivery'
+    $fakeRunner = [pscustomobject]@{
+        Name = 'fake'; EventVersion = 1; CommandDescription = 'fake agent runner'
+        Discover = { param($Runner) [pscustomobject]@{ Name = 'fake-agent' } }
+        Start = {
+        param($Runner, $Prompt, $LogPath, $StateDirectory, $WorkingDirectory)
         $script:fakeRunnerCalls++
         $script:fakeRunnerWorkingDirectory = $WorkingDirectory
         if (-not (Test-Path -LiteralPath $StateDirectory)) { New-Item -ItemType Directory -Path $StateDirectory -Force | Out-Null }
-        [IO.File]::WriteAllText($LogPath, '{"type":"completed","message":"token=[redacted]"}')
+        [IO.File]::WriteAllText($LogPath, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"fake activity"}')
         [pscustomobject]@{ Id = 867; RunnerPath = 'fake-runner.ps1'; LogPath = $LogPath; StartedAt = [DateTimeOffset]::Parse('2026-08-30T12:00:00Z') }
+        }
     }
-    $fakeProcess = Start-IssueLaunchProcess -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath -CodexCommand 'fake-codex' -StartProcessScript $fakeRunner
-    Assert-Equal $script:fakeRunnerCalls 1 'The injected fake runner is used exactly once'
+    Assert-True (Test-IssueAgentRunner -Runner $fakeRunner) 'A fake runner satisfies the versioned runner contract'
+    Assert-Equal (Find-IssueAgentRunnerCommand -Runner $fakeRunner).Name 'fake-agent' 'Runner command discovery is lifecycle-neutral'
+    $fakeProcess = Start-IssueAgentRunner -Runner $fakeRunner -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath
+    Assert-Equal $script:fakeRunnerCalls 1 'The fake runner is used exactly once through the runner contract'
     Assert-Equal $fakeProcess.Id 867 'Fake runner supplies the tracked PID'
     Assert-Equal $script:fakeRunnerWorkingDirectory $plan.WorktreePath 'The fake runner is confined to the newly created worktree'
     $coreSource = Get-Content -LiteralPath (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Raw
     Assert-True ($coreSource -match 'function Protect-LaunchLogLine') 'The generated runner redacts credential-shaped JSONL values before writing its external log'
     Assert-True ($coreSource -match '\[Console\]::OutputEncoding' -and $coreSource -match '\$OutputEncoding') 'The generated runner reads Codex output as UTF-8 before writing JSONL'
     Assert-True ($coreSource -match "EnvironmentVariables.Remove\('GITHUB_ISSUES_TOKEN'\)") 'The generated child process explicitly removes the GitHub token environment variable'
-    Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The generated child process uses the workspace-write sandbox'
+    Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The built-in Codex runner uses the workspace-write sandbox'
+    Assert-True ($coreSource -match 'prompt \| &.*command exec --sandbox workspace-write --json -- -' -and $coreSource -notmatch 'exec --sandbox workspace-write --json -- .*prompt') 'The Codex runner delivers Issue text through standard input, not a command-line argument'
     $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
     Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
     Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'
@@ -443,13 +454,13 @@ try {
     $activeHeartbeat = Get-WatcherHeartbeatStatus -HeartbeatPath $heartbeatPath -MaximumAgeSeconds 60 -ProcessLookupScript { param($ProcessId) [pscustomobject]@{ StartTime = $testProcess.StartTime } }
     Assert-True $activeHeartbeat.Active 'A fresh heartbeat with the matching process identity is active'
     $followLogPath = Join-Path $temporaryRoot 'follow.jsonl'
-    [IO.File]::WriteAllText($followLogPath, '{"type":"agent_message","message":"existing event"}' + "`n")
+    [IO.File]::WriteAllText($followLogPath, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"existing event"}' + "`n")
     Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 88; status = 'running'; pid = 123; logPath = $followLogPath }) }) -Path $followStatePath
     $followStateBefore = Get-Content -LiteralPath $followStatePath -Raw
     $followCursors = @{}
     $initialFollowEvents = @(Get-FollowLogEvents -State (Read-IssueLaunchState -Path $followStatePath) -Cursors $followCursors -Initialize)
     Assert-Equal $initialFollowEvents.Count 0 'Follow does not replay JSONL that existed before observation began'
-    [IO.File]::AppendAllText($followLogPath, '{"type":"agent_message","message":"Authorization: Bearer github_pat_secret_value"}' + "`n")
+    [IO.File]::AppendAllText($followLogPath, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"Authorization: Bearer github_pat_secret_value"}' + "`n")
     $newFollowEvents = @(Get-FollowLogEvents -State (Read-IssueLaunchState -Path $followStatePath) -Cursors $followCursors)
     Assert-Equal $newFollowEvents.Count 1 'Follow returns a newly appended JSONL record'
     Assert-True ($newFollowEvents[0].Text -notmatch 'github_pat_secret_value') 'Follow redacts JSONL secrets before display'
@@ -497,16 +508,16 @@ try {
     Assert-True ($rendered.Detail -notmatch 'github_pat_secret_value') 'JSONL credentials are redacted before display'
     Assert-True ($rendered.Activity -notmatch 'github_pat_secret_value') 'Latest JSONL activity is redacted before display'
     $utf8Activity = -join @([char]0x0410, [char]0x0433, [char]0x0435, [char]0x043d, [char]0x0442, [char]0x0020, [char]0x0432, [char]0x044b, [char]0x043f, [char]0x043e, [char]0x043b, [char]0x043d, [char]0x044f, [char]0x0435, [char]0x0442, [char]0x0020, [char]0x043f, [char]0x0440, [char]0x043e, [char]0x0432, [char]0x0435, [char]0x0440, [char]0x043a, [char]0x0443)
-    $utf8Jsonl = [pscustomobject]@{ type = 'item.completed'; item = [pscustomobject]@{ type = 'agent_message'; text = $utf8Activity } } | ConvertTo-Json -Compress
+    $utf8Jsonl = [pscustomobject]@{ version = 1; type = 'watcher-agent-event'; event = 'activity'; message = $utf8Activity } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($jsonlFixture, $utf8Jsonl, [Text.UTF8Encoding]::new($false))
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Activity $utf8Activity 'UTF-8 JSONL activity preserves Cyrillic text'
-    [IO.File]::WriteAllText($jsonlFixture, '{"type":"agent_message","message":"Initial parsed activity."}' + "`n", [Text.UTF8Encoding]::new($false))
-    [IO.File]::AppendAllText($jsonlFixture, '{"type":"agent_message","message":"Partial needs-human human input approval required WATCHER_OUTCOME: failed command: C:\\agent\\run.exe')
+    [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"Initial parsed activity."}' + "`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::AppendAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"failed","message":"Partial command: C:\\agent\\run.exe"')
     $partialJsonlStatus = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $partialJsonlStatus.Status 'running' 'An incomplete final JSONL record cannot change a running launch status'
     Assert-Equal $partialJsonlStatus.Activity 'Initial parsed activity.' 'Activity ignores an incomplete final JSONL record'
     Assert-True ($partialJsonlStatus.Activity -notmatch 'command:') 'Activity never displays raw JSON fragments from an incomplete record'
-    [IO.File]::AppendAllText($jsonlFixture, '"}')
+    [IO.File]::AppendAllText($jsonlFixture, '}')
     $completedJsonlStatus = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $completedJsonlStatus.Status 'failed' 'The completed JSONL record is processed on the next read'
     Assert-True $completedJsonlStatus.HasOutcomeMarker 'A valid completed agent message preserves WATCHER_OUTCOME recognition'
@@ -542,20 +553,20 @@ try {
     Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
     Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
     $script:IsActivityMonitor = $false; $script:ActivityMonitorCompletedIssueKeys.Clear()
-    [IO.File]::WriteAllText($jsonlFixture, '{"type":"item.completed","item":{"type":"agent_message","text":"Implementation complete. WATCHER_OUTCOME: commit-request"}}' + "`n" + '{"type":"watcher-runner-exit","exitCode":0}')
+    [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"commit-request","message":"Implementation complete."}' + "`n" + '{"version":1,"type":"watcher-agent-event","event":"exit","exitCode":0}')
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'commit-request' 'Only an explicit commit-request marker asks the watcher to create a commit'
-    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"completed`"}`n{`"type`":`"watcher-runner-exit`",`"exitCode`":0}")
+    [IO.File]::WriteAllText($jsonlFixture, "{`"version`":1,`"type`":`"watcher-agent-event`",`"event`":`"activity`",`"message`":`"completed`"}`n{`"version`":1,`"type`":`"watcher-agent-event`",`"event`":`"exit`",`"exitCode`":0}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'needs-human' 'Normal process completion without an outcome marker never maps to done'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"A later step may return needs-human.`"}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'running' 'An incidental needs-human mention does not change launch status'
-    [IO.File]::WriteAllText($jsonlFixture, '{"type":"agent_message","message":"WATCHER_HUMAN_REQUEST: Please choose a credential provider.\nWATCHER_OUTCOME: needs-human"}')
+    [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"needs-human","message":"Needs a decision.","humanRequest":"Please choose a credential provider."}')
     $explicitHumanRequest = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $explicitHumanRequest.Status 'needs-human' 'An explicit human request with outcome marker maps to needs-human'
     Assert-Equal $explicitHumanRequest.HumanRequest 'Please choose a credential provider.' 'Only the explicit sanitized human request is retained'
-    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"agent_message`",`"message`":`"WATCHER_OUTCOME: failed`"}")
+    [IO.File]::WriteAllText($jsonlFixture, "{`"version`":1,`"type`":`"watcher-agent-event`",`"event`":`"outcome`",`"outcome`":`"failed`",`"message`":`"failed`"}")
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'failed' 'An explicit failed marker maps to failed'
-    [IO.File]::WriteAllText($jsonlFixture, '{"type":"watcher-runner-exit","exitCode":1}')
-    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'failed' 'A nonzero Codex runner exit maps to failed'
+    [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"exit","exitCode":1}')
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'failed' 'A nonzero runner exit maps to failed'
 
     Write-Host "PASS: $script:assertions assertions succeeded (no network requests)."
 }

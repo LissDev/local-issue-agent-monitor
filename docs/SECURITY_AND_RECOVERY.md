@@ -33,14 +33,16 @@ repository and protect it with the normal permissions of the current Windows
 user.
 
 Launch metadata contains repository, Issue number, branch, worktree path, PID,
-timestamps, baseline commit, attempt number, lifecycle status, and JSONL log
-path. It intentionally contains no GitHub token or Codex authentication
-material. The credential is kept only in
+timestamps, baseline commit, attempt number, lifecycle status, runner name and
+event version, and JSONL log path. It intentionally contains no GitHub token or
+Codex authentication material. The credential is kept only in
 the monitor process while it makes GitHub requests; it is not passed to the
-Codex child process. Console and JSONL summaries redact bearer values, GitHub
+Codex child process. The built-in Codex runner sends the Issue prompt through
+standard input instead of child-process command-line syntax, then writes only
+versioned normalized runner events to JSONL. Console and JSONL summaries redact bearer values, GitHub
 token-shaped strings, OpenAI-style keys, and common `Authorization`/`token`
-assignments before displaying them. Treat raw JSONL as potentially sensitive
-anyway: it is an external tool log and should not be shared without review.
+assignments before displaying them. Treat normalized JSONL as potentially
+sensitive anyway: it is an external tool log and should not be shared without review.
 
 The Codex child is launched with the `workspace-write` sandbox. It can change
 files in its assigned worktree but does not receive Git metadata write access;
