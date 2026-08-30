@@ -476,6 +476,18 @@ try {
     $utf8Jsonl = [pscustomobject]@{ type = 'item.completed'; item = [pscustomobject]@{ type = 'agent_message'; text = $utf8Activity } } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($jsonlFixture, $utf8Jsonl, [Text.UTF8Encoding]::new($false))
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Activity $utf8Activity 'UTF-8 JSONL activity preserves Cyrillic text'
+    [IO.File]::WriteAllText($jsonlFixture, '{"type":"agent_message","message":"Initial parsed activity."}' + "`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::AppendAllText($jsonlFixture, '{"type":"agent_message","message":"Partial needs-human human input approval required WATCHER_OUTCOME: failed command: C:\\agent\\run.exe')
+    $partialJsonlStatus = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
+    Assert-Equal $partialJsonlStatus.Status 'running' 'An incomplete final JSONL record cannot change a running launch status'
+    Assert-Equal $partialJsonlStatus.Activity 'Initial parsed activity.' 'Activity ignores an incomplete final JSONL record'
+    Assert-True ($partialJsonlStatus.Activity -notmatch 'command:') 'Activity never displays raw JSON fragments from an incomplete record'
+    [IO.File]::AppendAllText($jsonlFixture, '"}')
+    $completedJsonlStatus = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
+    Assert-Equal $completedJsonlStatus.Status 'failed' 'The completed JSONL record is processed on the next read'
+    Assert-True $completedJsonlStatus.HasOutcomeMarker 'A valid completed agent message preserves WATCHER_OUTCOME recognition'
+    [IO.File]::WriteAllText($jsonlFixture, '{"type":"command_execution","output":"Test output mentions needs-human, human input, approval required, and WATCHER_OUTCOME: failed."}', [Text.UTF8Encoding]::new($false))
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'running' 'Command output mentioning human intervention does not change launch status'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
     $monitorRows = @(Get-ActivityMonitorRows ([pscustomobject]@{ launches = @(
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 98; status = 'done'; pid = 1234; logPath = '' },
