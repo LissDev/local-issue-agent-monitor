@@ -2,8 +2,8 @@
 
 `v1` is a local PowerShell monitor for GitHub Issues.  It can start one
 isolated, headless Codex CLI process when a ready Issue is explicitly marked
-`agent:run`.  The monitor creates no commits, pushes, pull requests, merges, or
-worktree deletions.
+`agent:run`. It creates a local commit only after an explicit validated agent
+request; it never pushes, opens pull requests, merges, or deletes worktrees.
 
 ## Safety envelope
 
@@ -22,7 +22,9 @@ after `agent:done` or `agent:needs-human` creates a numbered new attempt with a
 distinct branch and worktree. Issue title, body, and labels are passed directly
 to the agent as untrusted task data. The prompt says that repository rules and
 watcher constraints take priority, and the agent does not need to open GitHub in
-a browser to read the Issue.
+a browser to read the Issue. The agent is launched with Codex's
+`workspace-write` sandbox, so it can edit worktree files but does not receive
+Git metadata write access.
 
 ## Installation and configuration
 
@@ -130,12 +132,16 @@ whether to continue manually or create a new Issue/launch request.
 
 On a successful actual start the monitor changes `agent:run` to `agent:running`.
 The agent must finish its response with exactly one marker:
-`WATCHER_OUTCOME: done`, `WATCHER_OUTCOME: needs-human`, or
-`WATCHER_OUTCOME: failed`. `agent:done` requires both the `done` marker and a
-new commit relative to the branch baseline. A clarification request or a normal
-exit without a valid marker becomes `agent:needs-human`; an explicit `failed`
-marker, nonzero Codex exit, or launch error becomes `agent:failed`. A GitHub
-label failure is reported but does not stop or delete the local process.
+`WATCHER_OUTCOME: commit-request`, `WATCHER_OUTCOME: needs-human`, or
+`WATCHER_OUTCOME: failed`. A `commit-request` tells the watcher to validate the
+exact recorded worktree, expected branch, unchanged launch baseline, non-empty
+diff, and `git diff --check`; only then does it stage all changes and create one
+local commit. Validation or commit failure becomes `agent:needs-human` with a
+recoverable diagnostic. The watcher never pushes, opens pull requests, merges,
+or performs other remote Git writes. A clarification request or normal exit
+without a valid marker becomes `agent:needs-human`; an explicit `failed` marker,
+nonzero Codex exit, or launch error becomes `agent:failed`. A GitHub label
+failure is reported but does not stop or delete the local process.
 
 See [security and recovery guidance](docs/SECURITY_AND_RECOVERY.md) for token,
 log, and first-run details.
@@ -158,9 +164,10 @@ Do this only with a disposable, ready test Issue and a clean local repository:
 
 ## Self-check
 
-The tests use no network, no Pester, no real Git, and no real Codex process; a
-fake runner emits JSONL through the Core seam. Credential Manager and GitHub
-requests are also replaced by offline test seams.
+The tests use no network, no Pester, and no real Codex process; a fake runner
+emits JSONL through the Core seam. They create disposable local Git fixtures to
+exercise watcher-side commits. Credential Manager and GitHub requests are also
+replaced by offline test seams.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1

@@ -42,6 +42,11 @@ token-shaped strings, OpenAI-style keys, and common `Authorization`/`token`
 assignments before displaying them. Treat raw JSONL as potentially sensitive
 anyway: it is an external tool log and should not be shared without review.
 
+The Codex child is launched with the `workspace-write` sandbox. It can change
+files in its assigned worktree but does not receive Git metadata write access;
+the watcher performs the local commit only after a `commit-request` passes its
+validation gates.
+
 ## Failure and interruption
 
 The monitor never removes branches, worktrees, runner files, JSONL, or agent
@@ -64,11 +69,15 @@ stop processes.
 The watcher sends the Issue title, body, and labels to Codex as untrusted task
 data. The trusted prompt envelope requires repository rules to take priority
 and tells Codex not to open GitHub in a browser for the task. The final agent
-response must include one `WATCHER_OUTCOME` marker. A `done` marker still needs
-a new commit compared with the launch baseline; otherwise the watcher records
-`needs-human`. A normal exit without the marker and an agent clarification also
-record `needs-human`. Explicit failure, a nonzero child exit, and launch errors
-record `failed`.
+response must include one `WATCHER_OUTCOME` marker. A `commit-request` marker
+lets the watcher, rather than the sandboxed agent, create the local commit. The
+watcher verifies the exact recorded worktree and branch, confirms HEAD still
+equals the stored launch baseline, requires a non-empty diff, and runs `git diff
+--check` before staging and committing. A validation or commit failure records
+`needs-human` and preserves the worktree for recovery. The watcher never pushes,
+creates pull requests, merges, or makes another remote Git write. A normal exit
+without the marker and an agent clarification also record `needs-human`.
+Explicit failure, a nonzero child exit, and launch errors record `failed`.
 
 ## First actual launch checklist
 
@@ -77,6 +86,7 @@ configured paths are absolute and outside it, and the planned branch/worktree
 shown by `-WhatIf` are new.  Confirm the local `codex` command is signed in to
 the intended ChatGPT subscription.  Then enable `launch.enabled`, apply one
 `type:*` label plus `status:ready` and `agent:run`, and run one monitor poll.
-The expected observation is `queued` → `preflight` → `running` and a GitHub
-label transition to `agent:running`.  No commit, push, merge, or deletion is
-performed by the monitor.
+The expected observation is `queued` → `preflight` → `running`, then (after an
+agent `commit-request`) `done`, with a GitHub label transition to
+`agent:running` and then `agent:done`. The watcher may create one validated local
+commit in the tracked Issue worktree; it never pushes, merges, or deletes.
