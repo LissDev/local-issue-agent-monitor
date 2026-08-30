@@ -15,11 +15,14 @@ A launch is permitted only when all of these are true:
 - the calculated branch does not already exist; and
 - the calculated worktree path does not exist or belong to Git already.
 
-The branch is always `<type>/issue-<number>/<short-name>`.  Each launch gets a
+The first branch is `<type>/issue-<number>/<short-name>`. Each launch gets a
 new worktree below `launch.worktreeDirectory`; an existing branch or worktree is
-never reused, overwritten, or removed.  Issue content is treated as untrusted:
-the agent receives only its number, canonical URL, fixed boundaries, acceptance
-criteria, and manual-verification request.
+never reused, overwritten, or removed. A deliberate re-addition of `agent:run`
+after `agent:done` or `agent:needs-human` creates a numbered new attempt with a
+distinct branch and worktree. Issue title, body, and labels are passed directly
+to the agent as untrusted task data. The prompt says that repository rules and
+watcher constraints take priority, and the agent does not need to open GitHub in
+a browser to read the Issue.
 
 ## Installation and configuration
 
@@ -104,9 +107,13 @@ restarted automatically.  Inspect the preserved worktree and log, then decide
 whether to continue manually or create a new Issue/launch request.
 
 On a successful actual start the monitor changes `agent:run` to `agent:running`.
-At a terminal JSONL status it changes only that agent label to `agent:done`,
-`agent:needs-human`, or `agent:failed`.  A GitHub label failure is reported but
-does not stop or delete the local process.
+The agent must finish its response with exactly one marker:
+`WATCHER_OUTCOME: done`, `WATCHER_OUTCOME: needs-human`, or
+`WATCHER_OUTCOME: failed`. `agent:done` requires both the `done` marker and a
+new commit relative to the branch baseline. A clarification request or a normal
+exit without a valid marker becomes `agent:needs-human`; an explicit `failed`
+marker, nonzero Codex exit, or launch error becomes `agent:failed`. A GitHub
+label failure is reported but does not stop or delete the local process.
 
 See [security and recovery guidance](docs/SECURITY_AND_RECOVERY.md) for token,
 log, and first-run details.
