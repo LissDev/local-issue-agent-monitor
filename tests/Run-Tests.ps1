@@ -54,6 +54,22 @@ try {
     $unavailableCredentialMessage = ''
     try { Get-GitHubIssuesToken -CredentialReadScript { param($Target) throw 'credential store unavailable' } | Out-Null } catch { $unavailableCredentialMessage = $_.Exception.Message }
     Assert-True ($unavailableCredentialMessage -match 'Could not access Generic Credential') 'Credential store failures are understandable'
+    $cliCredentialProvider = New-GitHubCredentialProviderConfiguration -Provider ([pscustomobject]@{ type = 'github-cli' })
+    Assert-Equal $cliCredentialProvider.Type 'github-cli' 'GitHub CLI can be selected without changing source code'
+    $script:selectedProviderType = ''
+    $cliCredentialToken = Get-GitHubIssuesToken -CredentialProvider $cliCredentialProvider -CredentialProviderScript {
+        param($Provider)
+        $script:selectedProviderType = $Provider.Type
+        [pscustomobject]@{ State = 'available'; Token = $testToken }
+    }
+    Assert-Equal $cliCredentialToken $testToken 'An injected GitHub CLI provider supplies its token in memory'
+    Assert-Equal $script:selectedProviderType 'github-cli' 'The configured provider is passed to the offline credential seam'
+    $missingCliCredentialMessage = ''
+    try { Get-GitHubIssuesToken -CredentialProvider $cliCredentialProvider -CredentialProviderScript { param($Provider) [pscustomobject]@{ State = 'missing'; Token = $null } } | Out-Null } catch { $missingCliCredentialMessage = $_.Exception.Message }
+    Assert-True ($missingCliCredentialMessage -match 'gh auth login') 'A missing GitHub CLI credential explains how to authenticate'
+    $providerFailureMessage = ''
+    try { Get-GitHubIssuesToken -CredentialProvider $cliCredentialProvider -CredentialProviderScript { param($Provider) throw "provider failed with $testToken" } | Out-Null } catch { $providerFailureMessage = $_.Exception.Message }
+    Assert-True ($providerFailureMessage -notmatch [regex]::Escape($testToken)) 'Credential provider failures never reveal a token'
 
     $rawIssue = New-RawIssue
     $rawPullRequest = New-RawIssue -Number 43 -Title 'A pull request'
@@ -99,6 +115,20 @@ try {
         param($Uri, $Headers, $Repository) [pscustomobject]@{ Items = @(); Headers = @{} }
     }
     Assert-Equal $emptyPoll.SuccessfulRepositoryCount 1 'An empty Issues response is a successful poll'
+    $cliProviderPollConfig = [pscustomobject]@{
+        Repositories = @('example-org/example-repo'); WatchedLabels = @('status:ready'); PollIntervalSeconds = 60; CredentialProvider = $cliCredentialProvider
+    }
+    $script:cliProviderPollAuthorization = ''
+    $cliProviderPoll = Invoke-IssueMonitorPoll -Config $cliProviderPollConfig -StatePath (Join-Path $temporaryRoot 'github-cli-read-only-state.json') -DoNotSaveState -CredentialProviderScript {
+        param($Provider) [pscustomobject]@{ State = 'available'; Token = $testToken }
+    } -InvokeRestMethodScript {
+        param($Uri, $Headers, $Repository)
+        $script:cliProviderPollAuthorization = $Headers.Authorization
+        [pscustomobject]@{ Items = @(); Headers = @{} }
+    }
+    Assert-Equal $cliProviderPoll.SuccessfulRepositoryCount 1 'GitHub CLI provider supports a read-only monitor poll'
+    Assert-Equal $script:cliProviderPollAuthorization ('Bearer ' + $testToken) 'GitHub CLI provider token remains inside the monitor request path'
+    Assert-True (-not (Test-Path -LiteralPath $cliProviderPoll.StatePath)) 'Read-only GitHub CLI poll leaves no state file containing a token'
 
     # State transition: a ready Issue is announced once, then seen, then updated.
     $initialState = [pscustomobject]@{ version = 1; issues = @() }
@@ -133,6 +163,20 @@ try {
     $wrongCredentialTargetFailed = $false
     try { Get-IssueMonitorConfig -Path $wrongCredentialTargetPath | Out-Null } catch { $wrongCredentialTargetFailed = $true }
     Assert-True $wrongCredentialTargetFailed 'The configured credential target cannot override the fixed target'
+    $cliCredentialConfigPath = Join-Path $temporaryRoot 'github-cli-provider.json'
+    [System.IO.File]::WriteAllText($cliCredentialConfigPath, '{"githubCredentialProvider":{"type":"github-cli"},"repositories":["example-org/example-repo"],"watchedLabels":["status:ready"]}')
+    $cliCredentialConfig = Get-IssueMonitorConfig -Path $cliCredentialConfigPath
+    Assert-Equal $cliCredentialConfig.CredentialProvider.Type 'github-cli' 'Configuration selects the GitHub CLI provider'
+    $invalidCredentialProviderPath = Join-Path $temporaryRoot 'invalid-credential-provider.json'
+    [System.IO.File]::WriteAllText($invalidCredentialProviderPath, '{"githubCredentialProvider":{"type":"unsupported"},"repositories":["example-org/example-repo"],"watchedLabels":["status:ready"]}')
+    $invalidCredentialProviderFailed = $false
+    try { Get-IssueMonitorConfig -Path $invalidCredentialProviderPath | Out-Null } catch { $invalidCredentialProviderFailed = $true }
+    Assert-True $invalidCredentialProviderFailed 'An unavailable credential provider is rejected before polling'
+    $tokenInCredentialProviderPath = Join-Path $temporaryRoot 'token-in-credential-provider.json'
+    [System.IO.File]::WriteAllText($tokenInCredentialProviderPath, '{"githubCredentialProvider":{"type":"github-cli","token":"test-token-not-printed"},"repositories":["example-org/example-repo"],"watchedLabels":["status:ready"]}')
+    $tokenInCredentialProviderMessage = ''
+    try { Get-IssueMonitorConfig -Path $tokenInCredentialProviderPath | Out-Null } catch { $tokenInCredentialProviderMessage = $_.Exception.Message }
+    Assert-True ($tokenInCredentialProviderMessage -notmatch [regex]::Escape($testToken)) 'Rejected credential configuration does not reveal a token'
 
     # A missing Generic Credential rejects a request before the injected HTTP seam is called.
     $script:requestCalled = $false
@@ -141,6 +185,11 @@ try {
     try { Get-GitHubIssues -Repository 'example-org/example-repo' -CredentialReadScript { param($Target) [pscustomobject]@{ State = 'missing'; Password = $null } } -InvokeRestMethodScript $shouldNotRun | Out-Null } catch { $missingCredentialFailed = $true }
     Assert-True $missingCredentialFailed 'Missing credential is rejected'
     Assert-True (-not $script:requestCalled) 'Missing credential does not make an HTTP request'
+    $script:requestCalled = $false
+    $missingCliCredentialFailed = $false
+    try { Get-GitHubIssues -Repository 'example-org/example-repo' -CredentialProvider $cliCredentialProvider -CredentialProviderScript { param($Provider) [pscustomobject]@{ State = 'missing'; Token = $null } } -InvokeRestMethodScript $shouldNotRun | Out-Null } catch { $missingCliCredentialFailed = $true }
+    Assert-True $missingCliCredentialFailed 'Missing GitHub CLI credential is rejected'
+    Assert-True (-not $script:requestCalled) 'Missing GitHub CLI credential does not make an HTTP request'
 
     # A failed repository becomes an error event, while the remaining repositories are still polled.
     $twoRepositoryConfig = [pscustomobject]@{
