@@ -21,14 +21,15 @@ A launch is permitted only when all of these are true:
 - the calculated branch does not already exist; and
 - the calculated worktree path does not exist or belong to Git already.
 
-The first branch is `<type>/issue-<number>/<short-name>`. Each launch gets a
-new worktree below `launch.worktreeDirectory`; an existing branch or worktree is
-never reused, overwritten, or removed. A deliberate re-addition of `agent:run`
-after `agent:done` or `agent:needs-human` creates a numbered new attempt with a
-distinct branch and worktree. Issue title, body, and labels are passed directly
-to the agent as untrusted task data. The prompt says that repository rules and
-watcher constraints take priority, and the agent does not need to open GitHub in
-a browser to read the Issue. The agent is launched with Codex's
+The first branch is `<type>/issue-<number>/<short-name>`. Each initial launch
+gets a new worktree below `launch.worktreeDirectory`; an existing unrelated
+branch or worktree is never reused, overwritten, or removed. A deliberate
+re-addition of `agent:run` after a terminal agent status starts a new tracked
+process in the recorded Issue branch and worktree, preserving any uncommitted
+work and every prior JSONL log recorded in launch state. Issue title, body, and
+labels are passed directly to the agent as untrusted task data. The prompt says
+that repository rules and watcher constraints take priority, and the agent does
+not need to open GitHub in a browser to read the Issue. The agent is launched with Codex's
 `workspace-write` sandbox, so it can edit worktree files but does not receive
 Git metadata write access.
 
@@ -237,7 +238,10 @@ merged PR, closed Issue, exited process, and clean worktree first. This cleanup
 is deliberately not performed by the agent or watcher, so a failed,
 needs-human, or unmerged result remains recoverable.
 
-On a successful actual start the monitor changes `agent:run` to `agent:running`.
+On every lifecycle transition the monitor replaces all agent lifecycle labels,
+so an Issue has exactly one of `agent:run`, `agent:running`,
+`agent:needs-human`, `agent:failed`, or `agent:done`. On a successful actual
+start it becomes `agent:running`.
 The agent must finish its response with exactly one marker:
 `WATCHER_OUTCOME: commit-request`, `WATCHER_OUTCOME: needs-human`, or
 `WATCHER_OUTCOME: failed`. A `commit-request` tells the watcher to validate the

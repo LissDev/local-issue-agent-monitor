@@ -383,17 +383,14 @@ function Invoke-LaunchLabelTransition {
     param([Parameter(Mandatory)]$Issue, [Parameter(Mandatory)]$Launch, [Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Status, [Parameter(Mandatory)][string]$GitHubToken)
     $labelStatusProperty = $Launch.PSObject.Properties['labelStatus']
     $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
-    if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or $currentLabelStatus -eq $Status) { return $false }
+    $targetLabel = if ($Status -eq 'running') { 'agent:running' } else { 'agent:' + $Status }
+    $agentLabels = @($Issue.Labels | Where-Object { $_ -in @('agent:run', 'agent:running', 'agent:needs-human', 'agent:failed', 'agent:done') })
+    $alreadyConsistent = $agentLabels.Count -eq 1 -and $agentLabels[0] -eq $targetLabel
+    if ($WhatIf -or -not [bool]$Config.Launch.Enabled -or ($currentLabelStatus -eq $Status -and $alreadyConsistent)) { return $false }
     try {
-        $previousAgentStatusProperty = $Launch.PSObject.Properties['previousAgentStatus']
-        $previousAgentStatus = if ($null -eq $previousAgentStatusProperty) { '' } else { [string]$previousAgentStatusProperty.Value }
-        $removeAgentStatus = if ($currentLabelStatus -eq 'running') { 'running' } elseif ($previousAgentStatus -in @('done', 'needs-human', 'failed')) { $previousAgentStatus } else { 'run' }
-        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus $removeAgentStatus -GitHubToken $GitHubToken | Out-Null
-        if ($Status -eq 'running' -and $previousAgentStatus -in @('done', 'needs-human', 'failed')) {
-            # A conscious retry normally adds agent:run alongside the old terminal
-            # label. Remove both lifecycle labels so this attempt has one status.
-            Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -CurrentAgentStatus 'run' -GitHubToken $GitHubToken | Out-Null
-        }
+        # The Core request replaces every agent lifecycle label in one GitHub
+        # operation while preserving all non-agent labels from this Issue.
+        Request-IssueLaunchAgentLabel -Issue $Issue -Launch $Config.Launch -Status $Status -GitHubToken $GitHubToken | Out-Null
         Set-LaunchProperty $Launch 'labelStatus' $Status; return $true
     } catch { Write-LaunchEvent 'failed' $Issue ('GitHub label update failed; local process was left untouched: ' + $_.Exception.Message); return $false }
 }
@@ -452,12 +449,12 @@ function Invoke-LaunchMonitoring {
         $keyIssue = [pscustomobject]@{ Repository = [string]$launch.repository; Number = [int]$launch.issueNumber }
         if ([string]$launch.status -ne 'running') {
             Write-LaunchEvent ([string]$launch.status) $keyIssue 'tracked launch'
+            $isSuperseded = $null -ne $launch.PSObject.Properties['supersededAt'] -and -not [string]::IsNullOrWhiteSpace([string]$launch.supersededAt)
+            if ($isSuperseded) { continue }
             if ([string]$launch.status -in @('done', 'needs-human', 'failed')) {
-                $labelStatusProperty = $launch.PSObject.Properties['labelStatus']
-                $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
                 $currentIssue = $issuesByKey[([string]$launch.issue)]
-                $isExplicitRetry = $null -ne $currentIssue -and @($currentIssue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0 -and ([string]$launch.status -in @('done', 'needs-human'))
-                if ($currentLabelStatus -ne [string]$launch.status -and -not $isExplicitRetry) {
+                $isExplicitRetry = $null -ne $currentIssue -and @($currentIssue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0 -and ([string]$launch.status -in @('done', 'needs-human', 'failed'))
+                if (-not $isExplicitRetry) {
                     if (Invoke-LaunchLabelTransition $keyIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
                 }
                 if ([string]$launch.status -eq 'needs-human') {
@@ -466,11 +463,7 @@ function Invoke-LaunchMonitoring {
             }
             continue
         }
-        $labelStatusProperty = $launch.PSObject.Properties['labelStatus']
-        $currentLabelStatus = if ($null -eq $labelStatusProperty) { '' } else { [string]$labelStatusProperty.Value }
-        if ($currentLabelStatus -ne 'running') {
-            if (Invoke-LaunchLabelTransition $keyIssue $launch $Config 'running' $GitHubToken) { $stateChanged = $true }
-        }
+        if (Invoke-LaunchLabelTransition $keyIssue $launch $Config 'running' $GitHubToken) { $stateChanged = $true }
         $jsonl = Get-LaunchJsonlStatus $launch
         if ($jsonl.Status -ne 'running') {
             # A final response can reach JSONL shortly before its runner-exit
@@ -533,8 +526,11 @@ function Invoke-LaunchMonitoring {
             $process = Start-IssueAgentRunner -Runner $runner -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath
             $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $process.Id -LogPath $process.LogPath -ProcessStartedAt $process.StartedAt
             Set-LaunchProperty $metadata 'runnerPath' $process.RunnerPath; Set-LaunchProperty $metadata 'runner' $runner.Name; Set-LaunchProperty $metadata 'runnerEventVersion' $runner.EventVersion
-            $priorAgentStatus = @($issue.Labels | Where-Object { $_ -in @('agent:done', 'agent:needs-human', 'agent:failed') } | Select-Object -First 1)
-            if ($priorAgentStatus.Count -gt 0) { Set-LaunchProperty $metadata 'previousAgentStatus' ([string]$priorAgentStatus[0]).Substring(6) }
+            foreach ($priorLaunch in @($known)) {
+                if ([string]$priorLaunch.status -in @('done', 'needs-human', 'failed')) {
+                    Set-LaunchProperty $priorLaunch 'supersededAt' ([DateTimeOffset]::UtcNow.ToString('o'))
+                }
+            }
             $state.launches = @($state.launches) + @($metadata); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
             Write-LaunchEvent 'running' $issue ('Started tracked PID ' + $metadata.pid + '.')
             [void](Invoke-LaunchLabelTransition $issue $metadata $Config 'running' $GitHubToken); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath

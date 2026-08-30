@@ -363,7 +363,7 @@ try {
     $coreSource = Get-Content -LiteralPath (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Raw
     Assert-True ($coreSource -match 'function Protect-LaunchLogLine') 'The generated runner redacts credential-shaped JSONL values before writing its external log'
     Assert-True ($coreSource -match '\[Console\]::OutputEncoding' -and $coreSource -match '\$OutputEncoding') 'The generated runner reads Codex output as UTF-8 before writing JSONL'
-    Assert-True ($coreSource -match "EnvironmentVariables.Remove\('GITHUB_ISSUES_TOKEN'\)") 'The generated child process explicitly removes the GitHub token environment variable'
+    Assert-True ($coreSource -match 'Remove-Item -LiteralPath Env:GITHUB_ISSUES_TOKEN') 'The generated runner explicitly removes the GitHub token before launching an agent'
     Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The built-in Codex runner uses the workspace-write sandbox'
     Assert-True ($coreSource -match 'prompt \| &.*command exec --sandbox workspace-write --json -- -' -and $coreSource -notmatch 'exec --sandbox workspace-write --json -- .*prompt') 'The Codex runner delivers Issue text through standard input, not a command-line argument'
 
@@ -447,11 +447,31 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'
     Assert-Equal $metadata.attempt 1 'First launch metadata records attempt one'
     Assert-Equal $metadata.baseCommit '1111111111111111111111111111111111111111' 'Launch metadata records no secret and retains the baseline commit'
-    $retryLaunch = [pscustomobject]@{ repository = $launchIssue.Repository; issueNumber = $launchIssue.Number; status = 'needs-human' }
-    $retryPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit -PriorLaunches @($retryLaunch)
-    Assert-Equal $retryPlan.Attempt 2 'A completed or needs-human launch creates a new attempt after agent:run is added again'
-    Assert-True ($retryPlan.Branch -match '-attempt-2$') 'A retry gets a distinct branch instead of reusing the prior attempt'
-    Assert-True ($retryPlan.WorktreePath -match 'issue-77-attempt-2$') 'A retry gets a distinct worktree instead of reusing the prior attempt'
+    $retryLaunch = [pscustomobject]@{ repository = $launchIssue.Repository; issueNumber = $launchIssue.Number; status = 'needs-human'; attempt = 1; branch = $plan.Branch; path = $plan.WorktreePath }
+    $retryPath = {
+        param($Path, $PathType)
+        if ($PathType -eq 'Container' -and [IO.Path]::GetFullPath($Path) -eq $plan.WorktreePath) { return $true }
+        if ($PathType -eq 'Any') { return $false }
+        return $true
+    }
+    $retryGit = {
+        param($RepositoryPath, $Arguments)
+        if ($Arguments[0] -eq 'worktree' -and $Arguments[1] -eq 'list') { return @('worktree ' + $plan.WorktreePath) }
+        if ($Arguments[0] -eq 'branch' -and $Arguments -contains '--show-current') { return @($plan.Branch) }
+        if ($Arguments[0] -eq 'rev-parse' -and $Arguments[1] -eq 'HEAD') { return @('1111111111111111111111111111111111111111') }
+        return @()
+    }
+    $retryPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $enabledLaunch -TestPathScript $retryPath -GitScript $retryGit -PriorLaunches @($retryLaunch)
+    Assert-Equal $retryPlan.Attempt 2 'A terminal launch creates a numbered tracked retry after agent:run is added again'
+    Assert-True $retryPlan.ReuseExistingWorktree 'A retry is explicitly marked to reuse its recorded worktree'
+    Assert-Equal $retryPlan.Branch $plan.Branch 'A retry reuses the original Issue branch'
+    Assert-Equal $retryPlan.WorktreePath $plan.WorktreePath 'A retry reuses the original Issue worktree'
+    $preservedUncommittedFile = Join-Path $plan.WorktreePath 'preserved-for-human-review.txt'
+    [IO.File]::WriteAllText($preservedUncommittedFile, 'leave this uncommitted')
+    $retryWorktree = New-IssueLaunchWorktree -Plan $retryPlan -Launch $enabledLaunch -TestPathScript $retryPath -GitScript $retryGit
+    Assert-True $retryWorktree.Reused 'Retry validation reuses the registered worktree without creating another one'
+    Assert-True (-not $retryWorktree.Created) 'Retry does not issue a Git worktree creation request'
+    Assert-Equal (Get-Content -LiteralPath $preservedUncommittedFile -Raw) 'leave this uncommitted' 'Retry leaves uncommitted files in the reused worktree intact'
     $launchState = [pscustomobject]@{ version = 1; launches = @($metadata) }
     Save-IssueLaunchState -State $launchState -Path $launchStatePath
     Assert-True ((Get-Content -LiteralPath $launchStatePath -Raw) -notmatch [regex]::Escape($testToken)) 'Launch state never stores the GitHub token'
@@ -462,11 +482,20 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $reconciledMissing = Reconcile-IssueLaunchState -State $loadedLaunchState -ProcessIsAliveScript { param($ProcessId, $ProcessStartedAt) $false }
     Assert-True $reconciledMissing.Changed 'A missing PID is recorded as interrupted and never restarted'
     Assert-Equal $reconciledMissing.State.launches[0].status 'interrupted' 'Missing PID transition is interrupted'
+    $retryLogPath = Join-Path $stateDirectory 'issue-77-retry.jsonl'
+    [IO.File]::WriteAllText($retryLogPath, '{"version":1,"type":"watcher-agent-event","event":"activity","message":"retry"}' + "`n")
+    $retryMetadata = New-IssueLaunchMetadata -Plan $retryPlan -ProcessId 868 -LogPath $retryLogPath -ProcessStartedAt ([DateTimeOffset]::Parse('2026-08-30T12:01:00Z'))
+    $retryLogStatePath = Join-Path $temporaryRoot 'external-state\retry-launches.json'
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @($metadata, $retryMetadata) }) -Path $retryLogStatePath
+    $retryLogState = Read-IssueLaunchState -Path $retryLogStatePath
+    $trackedLogs = @(Find-IssueLaunchMetadata -State $retryLogState -Repository 'example-org/example-repo' -IssueNumber 77 | ForEach-Object { [string]$_.logPath })
+    Assert-Equal $trackedLogs.Count 2 'Retry launch state retains metadata for both attempts'
+    Assert-True (@($trackedLogs | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Every JSONL path retained in retry launch state remains readable'
 
     # Agent label writes are isolated behind a seam and are skipped for disabled
     # launch and plan-only mode.
     $script:labelCalls = 0
-    $fakeLabel = { param($Repository, $IssueNumber, $RemoveLabel, $AddLabel) $script:labelCalls++; $script:lastRemovedLabel = $RemoveLabel; $script:lastAddedLabel = $AddLabel }
+    $fakeLabel = { param($Repository, $IssueNumber, $Labels) $script:labelCalls++; $script:lastLabels = @($Labels) }
     $whatIfLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -WhatIf -LabelRequestScript $fakeLabel
     Assert-Equal $whatIfLabel.Reason 'what-if' 'WhatIf does not call the GitHub label seam'
     Assert-Equal $script:labelCalls 0 'No label write occurs in WhatIf'
@@ -475,31 +504,37 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $actualLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -LabelRequestScript $fakeLabel
     Assert-True $actualLabel.Requested 'Enabled launch invokes only the injected label seam'
     Assert-Equal $script:labelCalls 1 'The fake label seam is called once after the fake start'
-    Assert-Equal $script:lastRemovedLabel 'agent:run' 'The initial transition removes only agent:run'
-    Assert-Equal $script:lastAddedLabel 'agent:running' 'The initial transition adds agent:running'
+    Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'The initial transition leaves exactly one agent lifecycle label'
+    Assert-True ($script:lastLabels -contains 'agent:running') 'The initial transition sets agent:running'
+    Assert-True ($script:lastLabels -contains 'priority:high') 'A lifecycle transition preserves non-agent Issue labels'
     Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'done' -LabelRequestScript $fakeLabel | Out-Null
-    Assert-Equal $script:lastRemovedLabel 'agent:running' 'A terminal transition replaces agent:running'
-    Assert-Equal $script:lastAddedLabel 'agent:done' 'A terminal transition adds only agent:done'
+    Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'A terminal transition leaves exactly one agent lifecycle label'
+    Assert-True ($script:lastLabels -contains 'agent:done') 'A terminal transition sets agent:done'
     Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'needs-human' -LabelRequestScript $fakeLabel | Out-Null
-    Assert-Equal $script:lastAddedLabel 'agent:needs-human' 'A clarification outcome adds agent:needs-human'
+    Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'A clarification transition removes agent:run or agent:running in the same label set'
+    Assert-True ($script:lastLabels -contains 'agent:needs-human') 'A clarification outcome sets agent:needs-human'
     Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'failed' -LabelRequestScript $fakeLabel | Out-Null
-    Assert-Equal $script:lastAddedLabel 'agent:failed' 'An explicit failure outcome adds agent:failed'
-    Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -CurrentAgentStatus 'needs-human' -LabelRequestScript $fakeLabel | Out-Null
-    Assert-Equal $script:lastRemovedLabel 'agent:needs-human' 'A retry can remove the prior needs-human label before it starts'
-    Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'done' -CurrentAgentStatus 'run' -LabelRequestScript $fakeLabel | Out-Null
-    Assert-Equal $script:lastRemovedLabel 'agent:run' 'Recovered terminal transition can replace the original run label'
-    Assert-Equal $script:lastAddedLabel 'agent:done' 'Recovered terminal transition preserves the terminal result'
+    Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'An explicit failure transition leaves exactly one agent lifecycle label'
+    Assert-True ($script:lastLabels -contains 'agent:failed') 'An explicit failure outcome sets agent:failed'
+    $retryIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 77 -Labels @('type:feat', 'status:ready', 'priority:high', 'agent:needs-human', 'agent:run'))
+    Request-IssueLaunchAgentLabel -Issue $retryIssue -Launch $enabledLaunch -Status 'running' -LabelRequestScript $fakeLabel | Out-Null
+    Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'Retry start clears the prior terminal label and agent:run together'
+    Assert-True ($script:lastLabels -contains 'agent:running') 'Retry start sets agent:running'
     $script:labelHttpCalls = 0
     $labelHttpRequest = {
         param($Uri, $Headers, $Method, $Body)
         $script:labelHttpCalls++
         $script:labelAuthorization = $Headers.Authorization
+        $script:labelHttpMethod = $Method
+        $script:labelHttpLabels = @($Body | ConvertFrom-Json).labels
         [pscustomobject]@{}
     }
     $directLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -GitHubToken $testToken -InvokeRestMethodScript $labelHttpRequest
     Assert-True $directLabel.Requested 'Production label transition runs in the Core module without a script callback'
-    Assert-Equal $script:labelHttpCalls 2 'Credential token authorizes both label API requests'
+    Assert-Equal $script:labelHttpCalls 1 'Credential token authorizes one atomic label replacement request'
     Assert-Equal $script:labelAuthorization ('Bearer ' + $testToken) 'Credential token authorizes agent label updates'
+    Assert-Equal $script:labelHttpMethod 'Put' 'Lifecycle labels are replaced in a single GitHub request'
+    Assert-Equal @($script:labelHttpLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'The GitHub request contains exactly one lifecycle label'
     $script:commentHttpCalls = 0
     $commentHttpRequest = {
         param($Uri, $Headers, $Method, $Body)
@@ -554,6 +589,7 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True (-not $changedBranchCommit.Committed) 'A changed worktree branch never receives a watcher-side commit'
     Assert-True ($changedBranchCommit.Message -match 'not registered on expected branch') 'A changed branch has a recoverable diagnostic'
 
+    & git -C $changedBranchWorktree.Path checkout --quiet $fixturePlan.Branch
     $failedCommitPlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $fixtureLaunch -PriorLaunches @($fixtureMetadata, $emptyMetadata, $changedBranchMetadata)
     $failedCommitWorktree = New-IssueLaunchWorktree -Plan $failedCommitPlan -Launch $fixtureLaunch
     $failedCommitMetadata = New-IssueLaunchMetadata -Plan $failedCommitPlan -ProcessId 904 -LogPath (Join-Path $temporaryRoot 'fixture-failed.jsonl')
