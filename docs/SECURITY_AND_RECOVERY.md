@@ -19,9 +19,11 @@ lifecycle label after an actual launch or terminal result. If GitHub rejects
 the token, its repository permissions, or required organization SSO, the
 monitor prints a corrective message without printing the token.
 
-The Codex CLI uses the existing local ChatGPT subscription sign-in.  Do not add
-an OpenAI API key, API billing value, or a copied ChatGPT Desktop session to the
-configuration, prompt, runner, or logs.
+The built-in Codex CLI uses the existing local ChatGPT subscription sign-in.
+Do not add an OpenAI API key, API billing value, or a copied ChatGPT Desktop
+session to the configuration, prompt, runner, or logs. A configured external
+CLI manages its own vendor authentication; the monitor does not install,
+authenticate, or pass credentials to it.
 
 ## What the monitor records
 
@@ -36,17 +38,21 @@ Launch metadata contains repository, Issue number, branch, worktree path, PID,
 timestamps, baseline commit, attempt number, lifecycle status, runner name and
 event version, and JSONL log path. It intentionally contains no GitHub token or
 Codex authentication material. The credential is kept only in
-the monitor process while it makes GitHub requests; it is not passed to the
-Codex child process. The built-in Codex runner sends the Issue prompt through
-standard input instead of child-process command-line syntax, then writes only
-versioned normalized runner events to JSONL. Console and JSONL summaries redact bearer values, GitHub
+the monitor process while it makes GitHub requests; it is not passed to an
+agent child process. The built-in Codex runner sends the Issue prompt through
+standard input; an external runner uses its configured standard-input or UTF-8
+prompt-file transport. Neither puts Issue text into shell syntax or a child
+process command line, and both write only versioned normalized runner events to
+JSONL. Console and JSONL summaries redact bearer values, GitHub
 token-shaped strings, OpenAI-style keys, and common `Authorization`/`token`
 assignments before displaying them. Treat normalized JSONL as potentially
 sensitive anyway: it is an external tool log and should not be shared without review.
 
-The Codex child is launched with the `workspace-write` sandbox. It can change
-files in its assigned worktree but does not receive Git metadata write access;
-the watcher performs the local commit only after a `commit-request` passes its
+The built-in Codex child is launched with the `workspace-write` sandbox. An
+external child is confined by the monitor to the assigned worktree as its
+working directory, but its vendor-specific sandboxing is outside the generic
+contract. Neither receives the monitor's GitHub token. In every case the
+watcher performs the local commit only after a `commit-request` passes its
 validation gates.
 
 ## Failure and interruption
