@@ -2,22 +2,30 @@
 
 ## Credentials and Codex sign-in
 
-The monitor reads its GitHub token only from the Generic Credential named
-`local-issue-agent-monitor/github-issues` in Windows Credential Manager. It
-does not read `GITHUB_ISSUES_TOKEN`. Create it manually in **Credential
-Manager** → **Windows Credentials** → **Add a generic credential**: use the
-exact name above as the Internet or network address and put the fine-grained
-GitHub token in **Password**. The user-name field is not used.
+The monitor resolves its GitHub token only from the selected
+`githubCredentialProvider`, and does not read `GITHUB_ISSUES_TOKEN`.
+`system-store` (the default) reads the Generic Credential named
+`local-issue-agent-monitor/github-issues` from Windows Credential Manager.
+Create it manually in **Credential Manager** → **Windows Credentials** → **Add
+a generic credential**: use that exact name as the Internet or network address
+and put the fine-grained GitHub token in **Password**. The user-name field is
+not used. This credential is bound to the current Windows user; every Windows
+user must create their own. `windows-credential-manager` remains an accepted
+alias for this provider.
 
-The credential is bound to the current Windows user. It is not a shared system
-credential, so each Windows user who runs the monitor must create their own.
-Do not put the token in `config.json`, the repository, a JSONL file, a command
-line, a PowerShell environment variable, or a registry value. The token needs
-access only to the monitored repositories and **Issues: Read and write**:
-reading lists Issues, while writing changes only `agent:run` to an agent
-lifecycle label after an actual launch or terminal result. If GitHub rejects
-the token, its repository permissions, or required organization SSO, the
-monitor prints a corrective message without printing the token.
+`github-cli` is the portable provider. Install GitHub CLI and authenticate it
+with `gh auth login --hostname github.com`. The monitor requests its token with
+`gh auth token --hostname github.com` only inside the monitor process; it never
+places it in configuration, a prompt, child-process environment, worktree file,
+state, console output, or JSONL.
+
+Do not put a token in `config.json`, the repository, a JSONL file, a command
+line, a PowerShell environment variable, or a registry value. Limit either
+provider credential to the monitored repositories. **Issues: Read** is enough
+for read-only polling. **Issues: Read and write** is required when the monitor
+changes `agent:*` labels or posts an agent status comment. If GitHub rejects a
+credential, its repository permissions, or required organization SSO, the
+monitor prints provider-specific corrective guidance without printing a token.
 
 The built-in Codex CLI uses the existing local ChatGPT subscription sign-in.
 Do not add an OpenAI API key, API billing value, or a copied ChatGPT Desktop

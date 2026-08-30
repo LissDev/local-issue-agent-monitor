@@ -45,21 +45,37 @@ repository.  The example is deliberately non-runnable until these paths are
 changed.
 
 The example configuration deliberately contains no token or credential value.
-The monitor always reads one fixed Generic Credential from Windows Credential
-Manager: `local-issue-agent-monitor/github-issues`. It does not read
-`GITHUB_ISSUES_TOKEN`, so a new PowerShell window needs no environment setup.
+Select one credential provider in `githubCredentialProvider`; credentials are
+resolved only inside the monitor process. The monitor never reads
+`GITHUB_ISSUES_TOKEN`.
 
-Create the credential for the current Windows user before the first poll:
+`system-store` is the default and preserves the existing Windows Credential
+Manager flow. Create a Generic Credential for the current Windows user:
 
 1. Open **Credential Manager** → **Windows Credentials** → **Add a generic credential**.
 2. Enter `local-issue-agent-monitor/github-issues` as the Internet or network address.
 3. Put a fine-grained GitHub token in **Password**. The user-name field is not used by the monitor.
 
-Limit the token to the monitored repositories and grant **Issues: Read and
-write**. Read access lists Issues; write access changes only the monitor's
-`agent:*` labels after an actual process start or terminal result. The Generic
-Credential belongs to the current Windows user; another Windows user must
-create their own credential.
+The Generic Credential belongs to the current Windows user; another Windows
+user must create their own credential. `windows-credential-manager` is also
+accepted as an explicit alias for `system-store`.
+
+For a portable provider, select GitHub CLI instead:
+
+```json
+"githubCredentialProvider": { "type": "github-cli" }
+```
+
+Install [GitHub CLI](https://cli.github.com/) and run `gh auth login --hostname
+github.com` before the first poll. The monitor runs `gh auth token --hostname
+github.com` only in its own process and keeps the returned value in memory.
+
+Limit either provider's credential to the monitored repositories. **Issues:
+Read** is the minimum permission for read-only polling. **Issues: Read and
+write** is required when launch processing changes `agent:*` labels or posts an
+agent status comment. If GitHub reports an authorization, repository, or SSO
+failure, update that selected provider credential rather than putting a token in
+the configuration.
 
 The built-in Codex runner must already be signed in with the user's ChatGPT subscription.
 This monitor does not use an OpenAI API key, API billing, or a copied desktop

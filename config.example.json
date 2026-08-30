@@ -2,7 +2,9 @@
   "repositories": [
     "example-org/example-repo"
   ],
-  "githubCredentialTarget": "local-issue-agent-monitor/github-issues",
+  "githubCredentialProvider": {
+    "type": "system-store"
+  },
   "pollIntervalSeconds": 60,
   "watchedLabels": [
     "status:ready",

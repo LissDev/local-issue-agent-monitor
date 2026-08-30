@@ -6,6 +6,49 @@ $script:GitHubApiVersion = '2022-11-28'
 $script:GitHubUserAgent = 'local-issue-agent-monitor-v0'
 $script:GitHubCredentialTarget = 'local-issue-agent-monitor/github-issues'
 
+function New-GitHubCredentialProviderConfiguration {
+    [CmdletBinding()]
+    param([AllowNull()]$Provider)
+
+    # The default deliberately preserves v1's Windows Credential Manager flow.
+    if ($null -eq $Provider) {
+        return [pscustomobject]@{ Type = 'system-store'; Target = $script:GitHubCredentialTarget }
+    }
+    if ($Provider -is [string] -or $null -eq $Provider.PSObject.Properties['type']) {
+        throw "Configuration value 'githubCredentialProvider.type' must be 'system-store' or 'github-cli'."
+    }
+    $type = ([string]$Provider.type).Trim().ToLowerInvariant()
+    # Keep the explicit Windows name as a supported, unsurprising migration alias.
+    if ($type -eq 'windows-credential-manager') { $type = 'system-store' }
+    if ($type -notin @('system-store', 'github-cli')) {
+        throw "Configuration value 'githubCredentialProvider.type' must be 'system-store' or 'github-cli'."
+    }
+    $target = $script:GitHubCredentialTarget
+    if ($null -ne $Provider.PSObject.Properties['target']) {
+        $target = ([string]$Provider.target).Trim()
+        if ($target -ne $script:GitHubCredentialTarget) {
+            throw "Configuration value 'githubCredentialProvider.target' cannot change the fixed system-store target '$script:GitHubCredentialTarget'."
+        }
+    }
+    foreach ($secretProperty in @('token', 'password', 'secret')) {
+        if ($null -ne $Provider.PSObject.Properties[$secretProperty]) {
+            throw "Configuration value 'githubCredentialProvider.$secretProperty' is not supported. Credentials must remain in the selected provider."
+        }
+    }
+    return [pscustomobject]@{ Type = $type; Target = $target }
+}
+
+function Get-GitHubCredentialProviderName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Provider)
+
+    switch ([string]$Provider.Type) {
+        'system-store' { return 'Windows Credential Manager provider' }
+        'github-cli' { return 'GitHub CLI provider' }
+        default { return 'configured GitHub credential provider' }
+    }
+}
+
 function Get-IssueMonitorConfig {
     [CmdletBinding()]
     param(
@@ -64,11 +107,13 @@ function Get-IssueMonitorConfig {
         $interval = $parsedInterval
     }
 
+    $rawCredentialProvider = if ($null -ne $config.PSObject.Properties['githubCredentialProvider']) { $config.githubCredentialProvider } else { $null }
     $rawLaunch = if ($null -ne $config.PSObject.Properties['launch']) { $config.launch } else { $null }
     $validatedConfig = [pscustomobject]@{
         Repositories        = @($repositories | Select-Object -Unique)
         PollIntervalSeconds = $interval
         WatchedLabels       = @($watchedLabels | Select-Object -Unique)
+        CredentialProvider  = New-GitHubCredentialProviderConfiguration -Provider $rawCredentialProvider
         Launch              = ConvertTo-IssueMonitorLaunchConfiguration -Launch $rawLaunch -Repositories @($repositories | Select-Object -Unique)
     }
     Test-IssueMonitorConfiguration -Config $validatedConfig | Out-Null
@@ -92,6 +137,9 @@ function Test-IssueMonitorConfiguration {
     }
     if ($null -eq $Config.PSObject.Properties['PollIntervalSeconds'] -or [int]$Config.PollIntervalSeconds -lt 5) {
         throw 'Monitor configuration pollIntervalSeconds must be at least 5.'
+    }
+    if ($null -ne $Config.PSObject.Properties['CredentialProvider']) {
+        New-GitHubCredentialProviderConfiguration -Provider ([pscustomobject]@{ type = $Config.CredentialProvider.Type; target = $Config.CredentialProvider.Target }) | Out-Null
     }
     if ($null -ne $Config.PSObject.Properties['Launch']) {
         Test-IssueMonitorLaunchConfiguration -Launch $Config.Launch -Repositories @($Config.Repositories) | Out-Null
@@ -1267,24 +1315,81 @@ namespace IssueMonitor {
     }
 }
 
-function Get-GitHubIssuesToken {
+function Read-GitHubCliCredential {
     [CmdletBinding()]
-    param([scriptblock]$CredentialReadScript)
+    param()
 
-    $target = Get-GitHubCredentialTarget
+    # gh owns its secure credential storage. Its token is captured in memory and
+    # never passed through a command line, environment variable, file, or log.
     try {
-        $credential = if ($null -ne $CredentialReadScript) { & $CredentialReadScript -Target $target } else { Read-WindowsGenericCredential -Target $target }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'gh'
+        $startInfo.Arguments = 'auth token --hostname github.com'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($startInfo)
     }
     catch {
-        throw "Could not access Generic Credential '$target' for GitHub Issues. $($_.Exception.Message)"
+        throw 'GitHub CLI provider is unavailable. Install GitHub CLI (gh), then run ''gh auth login --hostname github.com''.'
     }
+    $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+    # Do not surface stderr: GitHub CLI extensions and future versions could
+    # include sensitive context there. Reading it concurrently also prevents a
+    # verbose failure from blocking the provider process.
+    $standardErrorTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $standardOutput = $standardOutputTask.GetAwaiter().GetResult()
+    [void]$standardErrorTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($standardOutput)) {
+        throw 'GitHub CLI provider is not authenticated for github.com. Run ''gh auth login --hostname github.com'', then retry.'
+    }
+    return [pscustomobject]@{ State = 'available'; Token = $standardOutput.Trim() }
+}
+
+function Get-GitHubIssuesToken {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$CredentialProvider,
+        [scriptblock]$CredentialProviderScript,
+        # Compatibility seam for existing system-store tests and callers.
+        [scriptblock]$CredentialReadScript
+    )
+
+    $provider = New-GitHubCredentialProviderConfiguration -Provider $CredentialProvider
+    $providerName = Get-GitHubCredentialProviderName -Provider $provider
+    try {
+        if ($null -ne $CredentialProviderScript) {
+            $credential = & $CredentialProviderScript -Provider $provider
+        }
+        elseif ($provider.Type -eq 'system-store') {
+            $credential = if ($null -ne $CredentialReadScript) { & $CredentialReadScript -Target $provider.Target } else { Read-WindowsGenericCredential -Target $provider.Target }
+        }
+        else {
+            $credential = Read-GitHubCliCredential
+        }
+    }
+    catch {
+        if ($provider.Type -eq 'system-store') {
+            throw "Could not access Generic Credential '$($provider.Target)' for GitHub Issues. Check that Windows Credential Manager is available to the current user."
+        }
+        throw "$providerName could not provide a GitHub credential. Check that GitHub CLI is installed and authenticated with 'gh auth login --hostname github.com'."
+    }
+    $token = if ($null -ne $credential -and $null -ne $credential.PSObject.Properties['Token']) { [string]$credential.Token } elseif ($null -ne $credential -and $null -ne $credential.PSObject.Properties['Password']) { [string]$credential.Password } else { '' }
     if ($null -eq $credential -or [string]$credential.State -eq 'missing') {
-        throw "GitHub credential '$target' was not found. In Windows Credential Manager, add a Generic Credential with this exact Internet or network address and put the GitHub token in Password."
+        if ($provider.Type -eq 'system-store') {
+            throw "GitHub credential '$($provider.Target)' was not found. In Windows Credential Manager, add a Generic Credential with this exact Internet or network address and put the GitHub token in Password."
+        }
+        throw 'GitHub CLI provider has no GitHub credential for github.com. Run ''gh auth login --hostname github.com'', then retry.'
     }
-    if ([string]$credential.State -ne 'available' -or [string]::IsNullOrWhiteSpace([string]$credential.Password)) {
-        throw "GitHub credential '$target' is unavailable or has an empty password. Recreate the Generic Credential for the current Windows user."
+    if ([string]$credential.State -ne 'available' -or [string]::IsNullOrWhiteSpace($token)) {
+        if ($provider.Type -eq 'system-store') {
+            throw "GitHub credential '$($provider.Target)' is unavailable or has an empty password. Recreate the Generic Credential for the current Windows user."
+        }
+        throw 'GitHub CLI provider returned an empty credential. Run ''gh auth login --hostname github.com'', then retry.'
     }
-    return [string]$credential.Password
+    return $token
 }
 
 function Get-GitHubRequestHeaders {
@@ -1358,17 +1463,17 @@ function Get-GitHubRequestFailureMessage {
         return "GitHub API rate limit was reached while reading '$Repository'.$retryHint"
     }
     if ($statusCode -eq 401) {
-        return "GitHub rejected credential '$script:GitHubCredentialTarget' while accessing '$Repository'. Check that the token is valid and has not expired."
+        return "GitHub rejected the selected credential while accessing '$Repository'. Check that the provider is authenticated and its credential is valid."
     }
     if ($statusCode -eq 403) {
         $sso = Get-HeaderValue -Headers $responseHeaders -Name 'X-GitHub-SSO'
         if (-not [string]::IsNullOrWhiteSpace([string]$sso)) {
-            return "GitHub requires SSO authorization for '$Repository'. Authorize credential '$script:GitHubCredentialTarget' for the organization, then run the monitor again."
+            return "GitHub requires SSO authorization for '$Repository'. Authorize the selected provider credential for the organization, then run the monitor again."
         }
-        return "GitHub denied access to '$Repository'. Confirm credential '$script:GitHubCredentialTarget' can access the repository and has Issues: Read and write."
+        return "GitHub denied access to '$Repository'. Confirm the selected provider credential can access the repository and has Issues: Read for polling and Issues: Read and write for label transitions."
     }
     if ($statusCode -eq 404) {
-        return "GitHub could not access '$Repository'. Confirm credential '$script:GitHubCredentialTarget' can access the repository and has Issues: Read and write."
+        return "GitHub could not access '$Repository'. Confirm the selected provider credential can access the repository and has Issues: Read for polling and Issues: Read and write for label transitions."
     }
     return "GitHub Issues request failed for '$Repository': $message"
 }
@@ -1464,11 +1569,13 @@ function Get-GitHubIssues {
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')][string]$Repository,
         [string]$GitHubToken,
+        [AllowNull()]$CredentialProvider,
+        [scriptblock]$CredentialProviderScript,
         [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
-    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialProvider $CredentialProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript }
     $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $nextUrl = "https://api.github.com/repos/$encodedRepository/issues?state=all&sort=updated&direction=desc&per_page=100"
@@ -1495,11 +1602,13 @@ function Invoke-GitHubIssueLabelUpdate {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RemoveLabel,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AddLabel,
         [string]$GitHubToken,
+        [AllowNull()]$CredentialProvider,
+        [scriptblock]$CredentialProviderScript,
         [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
-    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialProvider $CredentialProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript }
     $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $baseUri = "https://api.github.com/repos/$encodedRepository/issues/$IssueNumber/labels"
@@ -1526,11 +1635,13 @@ function Invoke-GitHubIssueCommentCreate {
         [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$IssueNumber,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Body,
         [string]$GitHubToken,
+        [AllowNull()]$CredentialProvider,
+        [scriptblock]$CredentialProviderScript,
         [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
-    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialProvider $CredentialProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript }
     $headers = Get-GitHubRequestHeaders -Token $GitHubToken
     $encodedRepository = ($Repository -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
     $uri = "https://api.github.com/repos/$encodedRepository/issues/$IssueNumber/comments"
@@ -1614,11 +1725,16 @@ function Invoke-IssueMonitorPoll {
         [string]$StatePath = (Get-IssueMonitorStatePath),
         [switch]$DoNotSaveState,
         [string]$GitHubToken,
+        [AllowNull()]$CredentialProvider,
+        [scriptblock]$CredentialProviderScript,
         [scriptblock]$CredentialReadScript,
         [scriptblock]$InvokeRestMethodScript
     )
 
-    if ([string]::IsNullOrWhiteSpace($GitHubToken)) { $GitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript }
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+        $selectedProvider = if ($null -ne $CredentialProvider) { $CredentialProvider } elseif ($null -ne $Config.PSObject.Properties['CredentialProvider']) { $Config.CredentialProvider } else { $null }
+        $GitHubToken = Get-GitHubIssuesToken -CredentialProvider $selectedProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript
+    }
     $state = Read-IssueMonitorState -Path $StatePath
     $events = [System.Collections.Generic.List[object]]::new()
     $successfulRepositoryCount = 0
@@ -1639,8 +1755,8 @@ function Invoke-IssueMonitorPoll {
 }
 
 Export-ModuleMember -Function @(
-    'Get-IssueMonitorConfig', 'Test-IssueMonitorConfiguration', 'Get-IssueMonitorStatePath', 'Read-IssueMonitorState', 'Get-IssueMonitorState',
-    'Save-IssueMonitorState', 'Get-GitHubCredentialTarget', 'Get-GitHubIssuesToken', 'Invoke-GitHubIssuesPage', 'Get-GitHubIssues', 'Invoke-GitHubIssueLabelUpdate', 'Invoke-GitHubIssueCommentCreate',
+    'New-GitHubCredentialProviderConfiguration', 'Get-GitHubCredentialProviderName', 'Get-IssueMonitorConfig', 'Test-IssueMonitorConfiguration', 'Get-IssueMonitorStatePath', 'Read-IssueMonitorState', 'Get-IssueMonitorState',
+    'Save-IssueMonitorState', 'Get-GitHubCredentialTarget', 'Read-GitHubCliCredential', 'Get-GitHubIssuesToken', 'Invoke-GitHubIssuesPage', 'Get-GitHubIssues', 'Invoke-GitHubIssueLabelUpdate', 'Invoke-GitHubIssueCommentCreate',
     'ConvertTo-MonitoredIssue', 'Get-IssueMonitorEvents', 'Get-IssueMonitorEvent',
     'New-IssueMonitorErrorEvent', 'Invoke-IssueMonitorPoll',
     'Get-IssueLaunchStatePath', 'ConvertTo-IssueMonitorLaunchConfiguration', 'Test-IssueMonitorLaunchConfiguration',

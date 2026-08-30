@@ -530,13 +530,13 @@ function Invoke-LaunchMonitoring {
     }
 }
 function Invoke-MonitorIteration {
-    param([scriptblock]$CredentialReadScript, $ResolvedConfig)
+    param([scriptblock]$CredentialReadScript, [scriptblock]$CredentialProviderScript, $ResolvedConfig)
     try { $config = if ($null -ne $ResolvedConfig) { $ResolvedConfig } else { Get-IssueMonitorConfig -Path $ConfigPath } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false; Config = $null } }
     if ($PSCmdlet.ParameterSetName -eq 'Stop') {
         try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
     }
     try {
-        $gitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript
+        $gitHubToken = Get-GitHubIssuesToken -CredentialProvider $config.CredentialProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript
         $noStateWrite = [bool]$WhatIf -or -not [bool]$config.Launch.Enabled
         $result = Invoke-IssueMonitorPoll -Config $config -GitHubToken $gitHubToken -DoNotSaveState:$noStateWrite; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result $gitHubToken
         if ($result.SuccessfulRepositoryCount -eq 0) { Write-MonitorMessage 'No repository could be checked. Review the error rows above; local state was not changed.'; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
