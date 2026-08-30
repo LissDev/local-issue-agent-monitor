@@ -1,0 +1,40 @@
+name: Maintenance
+description: A scoped infrastructure or administrative task.
+labels: ["type:chore", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What maintainable outcome is needed?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: Which configurations, tools, or processes are affected?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: Which product and technical changes are excluded?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will the expected result and absence of side effects be confirmed?
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: What to open, what to do, and what result to see.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Links to configuration, Issues, or blockers.
+    validations:
+      required: false

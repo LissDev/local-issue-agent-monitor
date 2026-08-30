@@ -1,0 +1,40 @@
+name: Refactor
+description: A structural improvement with no change to agreed behavior.
+labels: ["type:refactor", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Which responsibility boundary or technical problem will be improved?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: Which parts of the code or documentation are affected?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: Which new features and rewrites are excluded?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will preserved behavior and the structural improvement be confirmed?
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: What to open, what to do, and what result to see.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Architectural decisions, related Issues, or blockers.
+    validations:
+      required: false

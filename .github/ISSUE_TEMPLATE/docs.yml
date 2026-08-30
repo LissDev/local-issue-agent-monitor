@@ -1,0 +1,40 @@
+name: Documentation
+description: A confirmed change to project documentation.
+labels: ["type:docs", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What knowledge or decision should become clear and accessible?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: Which documents and sections will be updated?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: Which technical changes will not be made?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What information must be confirmed and where can it be found?
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: Which documents to open and what to verify in them.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Links to decisions, Issues, or blockers.
+    validations:
+      required: false

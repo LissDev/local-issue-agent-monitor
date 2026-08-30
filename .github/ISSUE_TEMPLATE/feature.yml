@@ -1,0 +1,40 @@
+name: Feature
+description: A new, complete gameplay or user-facing capability.
+labels: ["type:feature", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What observable outcome should the user receive?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: What exactly will change?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: What is intentionally deferred?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable behavior, state changes, and important edge cases.
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: What to open, what to do, and what result to see.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Links to decisions, designs, previous Issues, or blockers.
+    validations:
+      required: false
