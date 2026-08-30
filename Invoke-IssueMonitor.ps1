@@ -38,6 +38,21 @@ function Add-ActivityMonitorNotice {
     param([Parameter(Mandatory)][string]$Message)
     if ($script:IsActivityMonitor) { [void]$script:ActivityMonitorNotices.Add((Protect-MonitorText $Message)) }
 }
+function Format-MonitorLocalTime {
+    param([Parameter(Mandatory)][datetimeoffset]$Timestamp)
+    # Persisted timestamps stay UTC. This formatter is only for console output
+    # and always includes a numeric local offset to avoid implying UTC.
+    return $Timestamp.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz', [Globalization.CultureInfo]::InvariantCulture)
+}
+function Format-MonitorLocalTimeText {
+    param([AllowNull()][string]$Timestamp)
+    if ([string]::IsNullOrWhiteSpace($Timestamp)) { return '-' }
+    try {
+        return Format-MonitorLocalTime ([DateTimeOffset]::Parse($Timestamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind))
+    } catch {
+        return Get-DisplayText $Timestamp 26
+    }
+}
 function Add-ActivityMonitorCompletedIssue {
     param([Parameter(Mandatory)]$Issue)
     if ($script:IsActivityMonitor) { [void]$script:ActivityMonitorCompletedIssueKeys.Add(('{0}#{1}' -f $Issue.Repository, $Issue.Number)) }
@@ -77,7 +92,7 @@ function Remove-ClosedIssueLaunches {
 }
 function Write-MonitorMessage {
     param([Parameter(Mandatory)][string]$Message, [string]$Status = 'error')
-    $line = '{0:u} | {1,-12} | {2}' -f [DateTimeOffset]::UtcNow, $Status, (Protect-MonitorText $Message)
+    $line = '{0} | {1,-12} | {2}' -f (Format-MonitorLocalTime ([DateTimeOffset]::UtcNow)), $Status, (Protect-MonitorText $Message)
     if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line; return }
     Write-Host $line
 }
@@ -94,7 +109,7 @@ function Get-DisplayText {
 }
 function Write-IssueMonitorEvent {
     param([Parameter(Mandatory)]$Event)
-    $time = [DateTimeOffset]::UtcNow.ToString('u')
+    $time = Format-MonitorLocalTime ([DateTimeOffset]::UtcNow)
     if ($Event.Status -eq 'error') {
         $repository = if ($Event.Repository) { $Event.Repository } else { '-' }
         $line = '{0} | {1,-12} | {2,-35} | {3}' -f $time, 'error', $repository, (Protect-MonitorText $Event.Message)
@@ -103,14 +118,14 @@ function Write-IssueMonitorEvent {
     $issue = $Event.Issue; $labels = @($issue.Labels) -join ', '
     if ([string]::IsNullOrWhiteSpace($labels)) { $labels = '-' }
     $ready = if ($Event.IsWatched) { ' READY' } else { '' }
-    $format = '{0} | {1,-12} | {2,-35} | #{3,-6} | {4,-14} | {5,-28} | {6,-20} | {7}{8}'
-    $line = $format -f $time, $Event.Status, $issue.Repository, $issue.Number, $issue.Type, (Get-DisplayText $labels 28), $issue.UpdatedAt, (Get-DisplayText $issue.Title), $ready
+    $format = '{0} | {1,-12} | {2,-35} | #{3,-6} | {4,-14} | {5,-28} | {6,-26} | {7}{8}'
+    $line = $format -f $time, $Event.Status, $issue.Repository, $issue.Number, $issue.Type, (Get-DisplayText $labels 28), (Format-MonitorLocalTimeText $issue.UpdatedAt), (Get-DisplayText $issue.Title), $ready
     if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }
 }
 function Write-LaunchEvent {
     param([Parameter(Mandatory)][string]$Status, [Parameter(Mandatory)]$Issue, [string]$Message = '')
     $suffix = if ([string]::IsNullOrWhiteSpace($Message)) { '' } else { ' | ' + (Protect-MonitorText $Message) }
-    $line = '{0:u} | {1,-12} | {2,-35} | #{3,-6}{4}' -f [DateTimeOffset]::UtcNow, $Status, $Issue.Repository, $Issue.Number, $suffix
+    $line = '{0} | {1,-12} | {2,-35} | #{3,-6}{4}' -f (Format-MonitorLocalTime ([DateTimeOffset]::UtcNow)), $Status, $Issue.Repository, $Issue.Number, $suffix
     if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }
 }
 
@@ -160,7 +175,7 @@ function Get-ActivityMonitorRows {
             Issue = [int]$launch.issueNumber
             Status = [string]$launch.status
             Pid = [string]$launch.pid
-            ActivityAt = [string]$jsonl.LastActivityAt
+            ActivityAt = Format-MonitorLocalTimeText ([string]$jsonl.LastActivityAt)
             Activity = Get-DisplayText $activity 120
         })
     }
@@ -171,7 +186,7 @@ function Write-ActivityMonitorSnapshot {
     param($Config, [Parameter(Mandatory)]$Iteration)
     Clear-Host
     Write-Host 'local-issue-agent-monitor v1 | live agent activity'
-    Write-Host ('Refreshed UTC: {0:u} | next poll: {1:u}' -f [DateTimeOffset]::UtcNow, [DateTimeOffset]::UtcNow.AddSeconds($Iteration.PollIntervalSeconds))
+    Write-Host ('Refreshed (local): {0} | next poll: {1}' -f (Format-MonitorLocalTime ([DateTimeOffset]::UtcNow)), (Format-MonitorLocalTime ([DateTimeOffset]::UtcNow.AddSeconds($Iteration.PollIntervalSeconds))))
     if ($null -eq $Config) {
         Write-Host 'Configuration is unavailable; no launch state can be shown.'
     }
@@ -187,10 +202,10 @@ function Write-ActivityMonitorSnapshot {
         }
         if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.' }
         else {
-            Write-Host ('{0,-35} {1,-8} {2,-14} {3,-8} {4,-20} {5}' -f 'Repository', 'Issue', 'Status', 'PID', 'Latest activity UTC', 'Activity')
+            Write-Host ('{0,-35} {1,-8} {2,-14} {3,-8} {4,-26} {5}' -f 'Repository', 'Issue', 'Status', 'PID', 'Latest activity (local)', 'Activity')
             foreach ($row in $rows) {
                 $activityAt = if ([string]::IsNullOrWhiteSpace($row.ActivityAt)) { '-' } else { $row.ActivityAt }
-                Write-Host ('{0,-35} #{1,-7} {2,-14} {3,-8} {4,-20} {5}' -f (Get-DisplayText $row.Repository 35), $row.Issue, (Get-DisplayText $row.Status 14), $row.Pid, $activityAt, (Get-DisplayText $row.Activity 120))
+                Write-Host ('{0,-35} #{1,-7} {2,-14} {3,-8} {4,-26} {5}' -f (Get-DisplayText $row.Repository 35), $row.Issue, (Get-DisplayText $row.Status 14), $row.Pid, $activityAt, (Get-DisplayText $row.Activity 120))
             }
         }
     }
@@ -332,7 +347,7 @@ function Write-FollowSnapshot {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)]$HeartbeatStatus)
     $heartbeat = $HeartbeatStatus.Heartbeat
     Write-Host 'local-issue-agent-monitor v1 | follow (read-only)'
-    Write-Host ('Watcher PID: {0} | Last heartbeat UTC: {1} | Config: {2}' -f $heartbeat.pid, $heartbeat.heartbeatAt, $heartbeat.config.launchStatePath)
+    Write-Host ('Watcher PID: {0} | Last heartbeat (local): {1} | Config: {2}' -f $heartbeat.pid, (Format-MonitorLocalTimeText $heartbeat.heartbeatAt), $heartbeat.config.launchStatePath)
     $rows = @((Read-IssueLaunchState -Path $Config.Launch.StatePath).launches | Where-Object { $null -ne $_ })
     if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.'; return }
     Write-Host ('{0,-35} {1,-8} {2,-14} {3}' -f 'Repository', 'Issue', 'Status', 'PID')

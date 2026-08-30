@@ -170,6 +170,12 @@ process. If the heartbeat is absent, stale, or belongs to a different process,
 Follow reports that there is nothing to observe and exits; it never starts a
 watcher automatically.
 
+All console timestamps use the local time zone of the machine running the
+monitor and include a numeric offset (for example, `2026-08-30 12:00:00 +03:00`).
+This includes normal poll rows, Watch and Follow snapshots, notices, and agent
+activity rows. Heartbeats, launch state, JSONL records, and GitHub timestamps
+remain persisted in UTC.
+
 Continuous polling is explicit:
 
 ```powershell
