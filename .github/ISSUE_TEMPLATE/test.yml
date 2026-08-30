@@ -1,0 +1,40 @@
+name: Testing
+description: Add or fix automated and manual verification.
+labels: ["type:test", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What confidence in behavior should the verification provide?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: Which scenarios and components are verified?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: Which mechanics and infrastructure will not change?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Which scenarios must pass and which errors must be detected?
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: What to open, what to do, and what result to see.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Links to features, regressions, or blockers.
+    validations:
+      required: false

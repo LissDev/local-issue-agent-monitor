@@ -1,0 +1,40 @@
+name: Bug fix
+description: A reproducible fix for a bug or regression.
+labels: ["type:fix", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One card describes one verifiable feature. Permanent rules are in this repository's documentation.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What incorrect observable behavior needs to be fixed?
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope
+      description: Where does the problem occur and what needs to change?
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Out of scope
+      description: Which adjacent improvements are intentionally deferred?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Reproduction before the fix, expected behavior, and regression protection.
+  - type: textarea
+    id: manual_check
+    attributes:
+      label: Manual verification
+      description: What to open, what to do, and what result to see.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Logs, screenshots, links to changes, or blockers.
+    validations:
+      required: false
