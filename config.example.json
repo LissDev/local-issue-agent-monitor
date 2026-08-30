@@ -15,6 +15,9 @@
     "repositoryPaths": {
       "example-org/example-repo": "C:\\src\\example-repo"
     },
-    "codexCommand": "codex"
+    "codexCommand": "codex",
+    "runner": {
+      "type": "codex"
+    }
   }
 }

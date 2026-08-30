@@ -123,6 +123,7 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
         return [pscustomobject]@{
             Enabled = $false; WorktreeDirectory = $null; StatePath = (Get-IssueLaunchStatePath)
             RepositoryPaths = @{}; CodexCommand = 'codex'
+            Runner = [pscustomobject]@{ Type = 'codex'; Command = 'codex'; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
         }
     }
     $enabled = $false
@@ -144,6 +145,49 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
         throw "Configuration value 'launch.statePath' must be an absolute file path."
     }
     if ([string]::IsNullOrWhiteSpace($codexCommand)) { throw "Configuration value 'launch.codexCommand' cannot be empty." }
+
+    $runnerSource = if ($null -ne $Launch.PSObject.Properties['runner']) { $Launch.runner } else { $null }
+    if ($null -eq $runnerSource) {
+        # Existing configurations select the built-in runner without migration.
+        $runner = [pscustomobject]@{ Type = 'codex'; Command = $codexCommand; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
+    }
+    else {
+        if ($runnerSource -is [string] -or $null -eq $runnerSource.PSObject.Properties['type']) {
+            throw "Configuration value 'launch.runner.type' must be either 'codex' or 'external'."
+        }
+        $runnerType = ([string]$runnerSource.type).Trim().ToLowerInvariant()
+        if ($runnerType -notin @('codex', 'external')) {
+            throw "Configuration value 'launch.runner.type' must be either 'codex' or 'external'."
+        }
+        $runnerCommand = if ($null -ne $runnerSource.PSObject.Properties['command']) { ([string]$runnerSource.command).Trim() } elseif ($runnerType -eq 'codex') { $codexCommand } else { '' }
+        if ([string]::IsNullOrWhiteSpace($runnerCommand)) { throw "Configuration value 'launch.runner.command' is required for the external runner." }
+        $runnerArguments = @()
+        if ($null -ne $runnerSource.PSObject.Properties['arguments']) {
+            if ($runnerSource.arguments -is [string] -or $runnerSource.arguments -isnot [System.Collections.IEnumerable]) {
+                throw "Configuration value 'launch.runner.arguments' must be an array of strings."
+            }
+            foreach ($argument in @($runnerSource.arguments)) {
+                if ($null -eq $argument -or $argument -isnot [string]) { throw "Configuration value 'launch.runner.arguments' must contain only strings." }
+                if ([string]$argument -match "[\x00\r\n]") { throw "Configuration value 'launch.runner.arguments' cannot contain NUL, carriage return, or newline characters." }
+                $runnerArguments += [string]$argument
+            }
+        }
+        $promptTransport = if ($null -ne $runnerSource.PSObject.Properties['promptTransport']) { ([string]$runnerSource.promptTransport).Trim().ToLowerInvariant() } else { '' }
+        $promptFileArgument = if ($null -ne $runnerSource.PSObject.Properties['promptFileArgument']) { [string]$runnerSource.promptFileArgument } else { '' }
+        if ($runnerType -eq 'codex') {
+            if ($runnerArguments.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($promptTransport) -or -not [string]::IsNullOrWhiteSpace($promptFileArgument)) {
+                throw "Configuration value 'launch.runner' for the Codex runner supports only 'type' and optional 'command'."
+            }
+            $runner = [pscustomobject]@{ Type = 'codex'; Command = $runnerCommand; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
+        }
+        else {
+            if ($promptTransport -notin @('stdin', 'file')) { throw "Configuration value 'launch.runner.promptTransport' for the external runner must be 'stdin' or 'file'." }
+            if ($promptTransport -eq 'file' -and [string]::IsNullOrWhiteSpace($promptFileArgument)) { throw "Configuration value 'launch.runner.promptFileArgument' is required when promptTransport is 'file'." }
+            if ($promptTransport -eq 'stdin' -and -not [string]::IsNullOrWhiteSpace($promptFileArgument)) { throw "Configuration value 'launch.runner.promptFileArgument' is supported only when promptTransport is 'file'." }
+            if ($promptFileArgument -match "[\x00\r\n]") { throw "Configuration value 'launch.runner.promptFileArgument' cannot contain NUL, carriage return, or newline characters." }
+            $runner = [pscustomobject]@{ Type = 'external'; Command = $runnerCommand; Arguments = @($runnerArguments); PromptTransport = $promptTransport; PromptFileArgument = $promptFileArgument }
+        }
+    }
 
     $paths = @{}
     $rawPaths = if ($null -ne $Launch.PSObject.Properties['repositoryPaths']) { $Launch.repositoryPaths } else { $null }
@@ -167,7 +211,7 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
     }
     return [pscustomobject]@{
         Enabled = $enabled; WorktreeDirectory = $worktreeDirectory; StatePath = $statePath
-        RepositoryPaths = $paths; CodexCommand = $codexCommand
+        RepositoryPaths = $paths; CodexCommand = $codexCommand; Runner = $runner
     }
 }
 
@@ -179,9 +223,12 @@ function Test-IssueMonitorLaunchConfiguration {
     )
     # Reuse the normalizer so manually-constructed configuration receives the
     # same validation as JSON configuration.
+    $runnerSource = if ($null -eq $Launch.PSObject.Properties['Runner'] -or $null -eq $Launch.Runner) { $null }
+        elseif ([string]$Launch.Runner.Type -eq 'codex') { [pscustomobject]@{ type = 'codex'; command = $Launch.Runner.Command } }
+        else { [pscustomobject]@{ type = $Launch.Runner.Type; command = $Launch.Runner.Command; arguments = @($Launch.Runner.Arguments); promptTransport = $Launch.Runner.PromptTransport; promptFileArgument = $Launch.Runner.PromptFileArgument } }
     $source = [pscustomobject]@{
         enabled = $Launch.Enabled; worktreeDirectory = $Launch.WorktreeDirectory
-        statePath = $Launch.StatePath; repositoryPaths = $Launch.RepositoryPaths; codexCommand = $Launch.CodexCommand
+        statePath = $Launch.StatePath; repositoryPaths = $Launch.RepositoryPaths; codexCommand = $Launch.CodexCommand; runner = $runnerSource
     }
     ConvertTo-IssueMonitorLaunchConfiguration -Launch $source -Repositories $Repositories | Out-Null
     return $true
@@ -714,6 +761,57 @@ function New-CodexIssueAgentRunner {
     }
 }
 
+function New-ExternalIssueAgentRunner {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory)][ValidateSet('stdin', 'file')][string]$PromptTransport,
+        [string]$PromptFileArgument = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { throw 'The external runner command cannot be empty.' }
+    if ($PromptTransport -eq 'file' -and [string]::IsNullOrWhiteSpace($PromptFileArgument)) { throw 'The external runner prompt-file argument cannot be empty when file transport is selected.' }
+    if ($PromptTransport -eq 'stdin' -and -not [string]::IsNullOrWhiteSpace($PromptFileArgument)) { throw 'The external runner prompt-file argument is supported only when file transport is selected.' }
+    $description = $Command
+    if ($Arguments.Count -gt 0) { $description += ' ' + ($Arguments -join ' ') }
+    $description += if ($PromptTransport -eq 'stdin') { ' < prompt on stdin' } else { ' < UTF-8 prompt file argument' }
+    return [pscustomobject]@{
+        Name = 'external'
+        EventVersion = $script:IssueAgentRunnerEventVersion
+        Command = $Command
+        Arguments = @($Arguments)
+        PromptTransport = $PromptTransport
+        PromptFileArgument = $PromptFileArgument
+        CommandDescription = $description
+        Discover = {
+            param($Runner)
+            $resolved = Get-Command -Name ([string]$Runner.Command) -ErrorAction SilentlyContinue
+            if ($null -eq $resolved) { throw "Configured external runner command '$($Runner.Command)' was not found. No worktree was created." }
+            return $resolved
+        }
+        Start = {
+            param($Runner, $Prompt, $LogPath, $StateDirectory, $WorkingDirectory)
+            Start-ExternalIssueAgentRunnerProcess -Command ([string]$Runner.Command) -Arguments @($Runner.Arguments) -PromptTransport ([string]$Runner.PromptTransport) -PromptFileArgument ([string]$Runner.PromptFileArgument) -Prompt $Prompt -LogPath $LogPath -StateDirectory $StateDirectory -WorkingDirectory $WorkingDirectory
+        }
+    }
+}
+
+function New-IssueAgentRunnerFromConfiguration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Launch)
+
+    if ($null -eq $Launch.PSObject.Properties['Runner'] -or $null -eq $Launch.Runner) {
+        return New-CodexIssueAgentRunner -Command ([string]$Launch.CodexCommand)
+    }
+    $runner = $Launch.Runner
+    if ([string]$runner.Type -eq 'codex') { return New-CodexIssueAgentRunner -Command ([string]$runner.Command) }
+    if ([string]$runner.Type -eq 'external') {
+        return New-ExternalIssueAgentRunner -Command ([string]$runner.Command) -Arguments @($runner.Arguments) -PromptTransport ([string]$runner.PromptTransport) -PromptFileArgument ([string]$runner.PromptFileArgument)
+    }
+    throw "Unsupported configured runner type '$($runner.Type)'."
+}
+
 function Test-IssueAgentRunner {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Runner)
@@ -787,6 +885,7 @@ function Protect-LaunchLogLine {
     `$safe = `$safe -replace '(?i)(authorization|token)\s*[:=]\s*[^\s,;"''`]+', '`$1=[redacted]'
     return `$safe
 }
+
 Set-Location -LiteralPath `$workingDirectory
 function Write-NormalizedAgentEvent {
     param([Parameter(Mandatory)][string]`$Event, [string]`$Message = '', [string]`$Outcome = '', [string]`$HumanRequest = '', [int]`$ExitCode = -2147483648)
@@ -843,6 +942,105 @@ exit `$exitCode
     if ($null -eq $process -or $process.Id -lt 1) { throw 'Could not start the separate PowerShell Codex process.' }
     $processStartedAt = try { [DateTimeOffset]$process.StartTime.ToUniversalTime() } catch { [DateTimeOffset]::UtcNow }
     return [pscustomobject]@{ Id = [int]$process.Id; RunnerPath = $runnerPath; LogPath = $logPath; WorkingDirectory = $workingDirectory; StartedAt = $processStartedAt }
+}
+
+function Start-ExternalIssueAgentRunnerProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory)][ValidateSet('stdin', 'file')][string]$PromptTransport,
+        [string]$PromptFileArgument = '',
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$StateDirectory,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
+    if (-not (Test-Path -LiteralPath $StateDirectory -PathType Container)) { New-Item -ItemType Directory -Path $StateDirectory -Force -ErrorAction Stop | Out-Null }
+    $runnerPath = Join-Path -Path $StateDirectory -ChildPath ('external-runner-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+    $promptBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Prompt))
+    $logBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($LogPath))
+    $workingDirectoryBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($WorkingDirectory))
+    $commandBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Command))
+    $argumentsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @($Arguments) -Compress)))
+    $transportBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PromptTransport))
+    $promptFileArgumentBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PromptFileArgument))
+    $runner = @"
+`$ErrorActionPreference = 'Continue'
+`$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$promptBase64'))
+`$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
+`$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
+`$command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$commandBase64'))
+`$runnerArguments = @([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$argumentsBase64')) | ConvertFrom-Json)
+`$promptTransport = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$transportBase64'))
+`$promptFileArgument = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$promptFileArgumentBase64'))
+`$utf8NoBom = [Text.UTF8Encoding]::new(`$false)
+[Console]::OutputEncoding = `$utf8NoBom
+`$OutputEncoding = `$utf8NoBom
+function Protect-LaunchLogLine {
+    param([AllowNull()][string]`$Text)
+    if (`$null -eq `$Text) { return '' }
+    `$safe = `$Text
+    `$safe = `$safe -replace '(?i)bearer\s+[^\s"''`]+', 'Bearer [redacted]'
+    `$safe = `$safe -replace '(?i)(github_pat|gh[pousr])_[A-Za-z0-9_\-]+', '[redacted]'
+    `$safe = `$safe -replace '(?i)sk-[A-Za-z0-9_\-]+', '[redacted]'
+    `$safe = `$safe -replace '(?i)(authorization|token)\s*[:=]\s*[^\s,;"''`]+', '`$1=[redacted]'
+    return `$safe
+}
+function Write-NormalizedAgentEvent {
+    param([Parameter(Mandatory)][string]`$Event, [string]`$Message = '', [string]`$Outcome = '', [string]`$HumanRequest = '', [int]`$ExitCode = -2147483648)
+    `$record = [ordered]@{ version = $script:IssueAgentRunnerEventVersion; type = 'watcher-agent-event'; event = `$Event }
+    if (-not [string]::IsNullOrWhiteSpace(`$Message)) { `$record.message = Protect-LaunchLogLine `$Message }
+    if (-not [string]::IsNullOrWhiteSpace(`$Outcome)) { `$record.outcome = `$Outcome }
+    if (-not [string]::IsNullOrWhiteSpace(`$HumanRequest)) { `$record.humanRequest = Protect-LaunchLogLine `$HumanRequest }
+    if (`$ExitCode -ne -2147483648) { `$record.exitCode = `$ExitCode }
+    (`$record | ConvertTo-Json -Compress) | Out-File -LiteralPath `$logPath -Append -Encoding utf8
+}
+function Write-ExternalOutcome {
+    param([Parameter(Mandatory)][string]`$Text)
+    `$requests = [regex]::Matches(`$Text, '(?im)^\s*WATCHER_HUMAN_REQUEST\s*:\s*(?<request>\S[^\r\n]*)\s*`$')
+    if (`$requests.Count -gt 0) { `$script:lastExternalHumanRequest = `$requests[`$requests.Count - 1].Groups['request'].Value }
+    `$matches = [regex]::Matches(`$Text, '(?im)^\s*WATCHER_OUTCOME\s*:\s*(done|needs-human|failed)\s*`$')
+    if (`$matches.Count -eq 0) { return }
+    `$outcome = `$matches[`$matches.Count - 1].Groups[1].Value.ToLowerInvariant()
+    if (`$outcome -eq 'needs-human') { `$script:pendingExternalOutcome = `$Text; return }
+    `$script:pendingExternalOutcome = ''
+    `$normalizedOutcome = if (`$outcome -eq 'done') { 'commit-request' } else { `$outcome }
+    Write-NormalizedAgentEvent -Event 'outcome' -Message `$Text -Outcome `$normalizedOutcome -HumanRequest `$script:lastExternalHumanRequest
+}
+Set-Location -LiteralPath `$workingDirectory
+`$script:lastExternalHumanRequest = ''
+`$script:pendingExternalOutcome = ''
+if (`$promptTransport -eq 'file') {
+    `$promptPath = Join-Path -Path (Split-Path -Path `$logPath -Parent) -ChildPath ('prompt-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    [IO.File]::WriteAllText(`$promptPath, `$prompt, `$utf8NoBom)
+    `$runnerArguments += @(`$promptFileArgument, `$promptPath)
+}
+if (`$promptTransport -eq 'stdin') {
+    `$prompt | & `$command @runnerArguments 2>&1 | ForEach-Object { `$raw = `$_.ToString(); Write-NormalizedAgentEvent -Event 'activity' -Message `$raw; Write-ExternalOutcome -Text `$raw }
+}
+else {
+    & `$command @runnerArguments 2>&1 | ForEach-Object { `$raw = `$_.ToString(); Write-NormalizedAgentEvent -Event 'activity' -Message `$raw; Write-ExternalOutcome -Text `$raw }
+}
+`$exitCode = `$LASTEXITCODE
+if (`$null -eq `$exitCode) { `$exitCode = 0 }
+if (-not [string]::IsNullOrWhiteSpace(`$script:pendingExternalOutcome)) {
+    Write-NormalizedAgentEvent -Event 'outcome' -Message `$script:pendingExternalOutcome -Outcome 'needs-human' -HumanRequest `$script:lastExternalHumanRequest
+}
+Write-NormalizedAgentEvent -Event 'exit' -ExitCode `$exitCode
+exit `$exitCode
+"@
+    [IO.File]::WriteAllText($runnerPath, $runner, [Text.UTF8Encoding]::new($false))
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Join-Path -Path $PSHOME -ChildPath 'powershell.exe')
+    $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-IssueLaunchCommandLineArgument -Value $runnerPath)
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    [void]$startInfo.EnvironmentVariables.Remove('GITHUB_ISSUES_TOKEN')
+    $process = [Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process -or $process.Id -lt 1) { throw 'Could not start the separate PowerShell external runner process.' }
+    $processStartedAt = try { [DateTimeOffset]$process.StartTime.ToUniversalTime() } catch { [DateTimeOffset]::UtcNow }
+    return [pscustomobject]@{ Id = [int]$process.Id; RunnerPath = $runnerPath; LogPath = $LogPath; WorkingDirectory = $WorkingDirectory; StartedAt = $processStartedAt }
 }
 
 function Start-IssueLaunchProcess {
@@ -1450,5 +1648,5 @@ Export-ModuleMember -Function @(
     'Test-IssueLaunchWorktreeSafety', 'Test-IssueLaunchBranchSafety', 'Test-IssueLaunchRepositorySafety', 'New-IssueLaunchWorktree',
     'New-IssueLaunchPrompt', 'New-IssueLaunchPlan',
     'Test-IssueLaunchStatePathSafety', 'New-IssueLaunchMetadata', 'Test-IssueLaunchHasNewCommit', 'Test-IssueLaunchCommitRequest', 'Invoke-IssueLaunchCommitRequest', 'Read-IssueLaunchState', 'Save-IssueLaunchState',
-    'Find-IssueLaunchMetadata', 'Reconcile-IssueLaunchState', 'New-CodexIssueAgentRunner', 'Test-IssueAgentRunner', 'Find-IssueAgentRunnerCommand', 'Start-IssueAgentRunner', 'Start-IssueLaunchProcess', 'Stop-IssueLaunchProcess', 'Request-IssueLaunchAgentLabel'
+    'Find-IssueLaunchMetadata', 'Reconcile-IssueLaunchState', 'New-CodexIssueAgentRunner', 'New-ExternalIssueAgentRunner', 'New-IssueAgentRunnerFromConfiguration', 'Test-IssueAgentRunner', 'Find-IssueAgentRunnerCommand', 'Start-IssueAgentRunner', 'Start-IssueLaunchProcess', 'Stop-IssueLaunchProcess', 'Request-IssueLaunchAgentLabel'
 )

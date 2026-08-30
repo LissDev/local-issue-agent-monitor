@@ -281,6 +281,82 @@ try {
     Assert-True ($coreSource -match "EnvironmentVariables.Remove\('GITHUB_ISSUES_TOKEN'\)") 'The generated child process explicitly removes the GitHub token environment variable'
     Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The built-in Codex runner uses the workspace-write sandbox'
     Assert-True ($coreSource -match 'prompt \| &.*command exec --sandbox workspace-write --json -- -' -and $coreSource -notmatch 'exec --sandbox workspace-write --json -- .*prompt') 'The Codex runner delivers Issue text through standard input, not a command-line argument'
+
+    # A disposable non-Codex PowerShell executable exercises the generic runner
+    # without network access or a vendor CLI. It records its CWD, prompt, and
+    # inherited GitHub-token variable for both supported prompt transports.
+    $fakeExternalPath = Join-Path $temporaryRoot 'fake-external.ps1'
+    $fakeExternal = @'
+param([string]$Mode, [string]$Outcome, [string]$ResultPath, [string]$PromptFile)
+$prompt = if ($Mode -eq 'file') { [IO.File]::ReadAllText($PromptFile, [Text.UTF8Encoding]::new($false)) } else { [Console]::In.ReadToEnd() }
+[pscustomobject]@{ cwd = (Get-Location).Path; prompt = $prompt; githubToken = [string]$env:GITHUB_ISSUES_TOKEN } | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding utf8
+Write-Output 'fake external activity'
+Write-Output ('WATCHER_OUTCOME: ' + $Outcome)
+if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose the fake external setting.' }
+'@
+    [IO.File]::WriteAllText($fakeExternalPath, $fakeExternal, [Text.UTF8Encoding]::new($false))
+    $savedGitHubToken = [Environment]::GetEnvironmentVariable('GITHUB_ISSUES_TOKEN', 'Process')
+    [Environment]::SetEnvironmentVariable('GITHUB_ISSUES_TOKEN', 'monitor-token-must-not-reach-external-cli', 'Process')
+    try {
+        foreach ($case in @(
+            [pscustomobject]@{ Transport = 'stdin'; Outcome = 'done' },
+            [pscustomobject]@{ Transport = 'file'; Outcome = 'needs-human' },
+            [pscustomobject]@{ Transport = 'stdin'; Outcome = 'failed' }
+        )) {
+            $transport = $case.Transport; $outcome = $case.Outcome
+            $resultPath = Join-Path $temporaryRoot ('external-' + $transport + '-' + $outcome + '.json')
+            $externalLogPath = Join-Path $stateDirectory ('issue-77-external-' + $transport + '-' + $outcome + '.jsonl')
+            $externalArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $fakeExternalPath, '-Mode', $transport, '-Outcome', $outcome, '-ResultPath', $resultPath)
+            $externalRunner = if ($transport -eq 'stdin') {
+                New-ExternalIssueAgentRunner -Command (Join-Path $PSHOME 'powershell.exe') -Arguments $externalArguments -PromptTransport stdin
+            }
+            else {
+                New-ExternalIssueAgentRunner -Command (Join-Path $PSHOME 'powershell.exe') -Arguments $externalArguments -PromptTransport file -PromptFileArgument '-PromptFile'
+            }
+            Assert-Equal $externalRunner.Name 'external' 'The generic adapter identifies its runner type'
+            Assert-True ((Find-IssueAgentRunnerCommand -Runner $externalRunner) -ne $null) 'The generic runner command is discovered before launch'
+            $externalProcess = Start-IssueAgentRunner -Runner $externalRunner -Prompt $plan.Prompt -LogPath $externalLogPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath
+            $trackedExternal = Get-Process -Id $externalProcess.Id
+            [void]$trackedExternal.WaitForExit(30000)
+            Assert-True $trackedExternal.HasExited 'The disposable external runner exits'
+            $externalResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            Assert-Equal $externalResult.cwd $plan.WorktreePath 'The external CLI starts in the assigned isolated worktree'
+            Assert-Equal $externalResult.prompt.TrimEnd("`r", "`n") $plan.Prompt 'The external CLI receives the complete prompt through its configured transport'
+            Assert-Equal $externalResult.githubToken '' 'The external CLI does not inherit the monitor GitHub-token environment variable'
+            $externalEvents = @(Get-Content -LiteralPath $externalLogPath -Encoding utf8 | ConvertFrom-Json)
+            Assert-True (@($externalEvents | Where-Object { $_.event -eq 'activity' -and $_.message -eq 'fake external activity' }).Count -eq 1) 'External output is retained as normalized activity'
+            $expectedNormalizedOutcome = if ($outcome -eq 'done') { 'commit-request' } else { $outcome }
+            Assert-True (@($externalEvents | Where-Object { $_.event -eq 'outcome' -and $_.outcome -eq $expectedNormalizedOutcome }).Count -eq 1) 'External terminal text is normalized to the expected watcher outcome'
+            if ($outcome -eq 'needs-human') {
+                Assert-True (@($externalEvents | Where-Object { $_.event -eq 'outcome' -and $null -ne $_.PSObject.Properties['humanRequest'] -and $_.humanRequest -eq 'Choose the fake external setting.' }).Count -eq 1) 'External needs-human retains its sanitized human request'
+            }
+            Assert-True (@($externalEvents | Where-Object { $_.event -eq 'exit' -and $_.exitCode -eq 0 }).Count -eq 1) 'External exit is retained in the normalized event stream'
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('GITHUB_ISSUES_TOKEN', $savedGitHubToken, 'Process')
+    }
+
+    $legacyRunnerLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{ enabled = $false; statePath = $launchStatePath; codexCommand = 'legacy-codex' }) -Repositories @('example-org/example-repo')
+    Assert-Equal $legacyRunnerLaunch.Runner.Type 'codex' 'Existing configuration without launch.runner keeps the Codex runner'
+    Assert-Equal $legacyRunnerLaunch.Runner.Command 'legacy-codex' 'Existing codexCommand remains the built-in runner command'
+    $configuredExternalLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+        enabled = $false; statePath = $launchStatePath
+        runner = [pscustomobject]@{ type = 'external'; command = 'fake-external'; arguments = @('run'); promptTransport = 'file'; promptFileArgument = '--prompt-file' }
+    }) -Repositories @('example-org/example-repo')
+    Assert-Equal (New-IssueAgentRunnerFromConfiguration -Launch $configuredExternalLaunch).Name 'external' 'Configuration selects the generic external runner'
+    $invalidRunnerMessage = ''
+    $invalidRunnerWorktrees = Join-Path $temporaryRoot 'invalid-runner-worktrees'
+    try {
+        ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+            enabled = $true; worktreeDirectory = $invalidRunnerWorktrees; statePath = $launchStatePath
+            repositoryPaths = @{ 'example-org/example-repo' = $repositoryPath }
+            runner = [pscustomobject]@{ type = 'external'; command = 'fake-agent'; promptTransport = 'unsupported' }
+        }) -Repositories @('example-org/example-repo') | Out-Null
+    }
+    catch { $invalidRunnerMessage = $_.Exception.Message }
+    Assert-True ($invalidRunnerMessage -match 'promptTransport') 'Unsupported external prompt transport has an actionable configuration error'
+    Assert-True (-not (Test-Path -LiteralPath $invalidRunnerWorktrees)) 'Invalid external configuration creates no worktree before launch'
     $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
     Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
     Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'

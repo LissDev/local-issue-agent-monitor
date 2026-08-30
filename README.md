@@ -1,7 +1,7 @@
 # local-issue-agent-monitor
 
 `v1` is a local PowerShell monitor for GitHub Issues.  It can start one
-isolated, headless Codex CLI process when a ready Issue is explicitly marked
+isolated, headless agent CLI process when a ready Issue is explicitly marked
 `agent:run`. It creates a local commit only after an explicit validated agent
 request; it never pushes, opens pull requests, merges, or deletes worktrees.
 
@@ -28,8 +28,9 @@ Git metadata write access.
 
 ## Installation and configuration
 
-Windows PowerShell 5.1 or PowerShell 7+, Git, Codex CLI, and GitHub access are
-required.  No external PowerShell modules or OpenAI API key are used.
+Windows PowerShell 5.1 or PowerShell 7+, Git, GitHub access, and either Codex
+CLI or a configured compatible external CLI are required. No external
+PowerShell modules or OpenAI API key are used.
 
 Copy the example and replace every example path with an absolute local path:
 
@@ -68,15 +69,70 @@ session.
 
 The monitor lifecycle is CLI-neutral. It asks a runner to discover its command,
 launch it in the isolated worktree, deliver the trusted prompt, and append
-normalized JSONL records. The built-in runner remains Codex-only for now and
-uses the existing `launch.codexCommand` setting; choosing a different runner is
-not yet configurable.
+normalized JSONL records. `launch.runner` selects either the built-in `codex`
+adapter or an `external` compatible CLI. If `launch.runner` is omitted, the
+monitor preserves the original behavior: it uses `launch.codexCommand` (or
+`codex`) with the built-in adapter.
+
+An external runner starts with its current directory set to the assigned
+worktree. It receives no monitor GitHub token: the wrapper explicitly removes
+`GITHUB_ISSUES_TOKEN`. It is responsible for any vendor-specific sign-in and
+must not depend on GitHub credentials or Git metadata supplied by the monitor.
+Its command and fixed arguments are configuration values; Issue text is never
+interpolated into shell syntax or an executable command line.
+
+Use this configuration for a CLI that reads the complete UTF-8 prompt on
+standard input:
+
+```json
+"runner": {
+  "type": "external",
+  "command": "example-agent",
+  "arguments": ["run"],
+  "promptTransport": "stdin"
+}
+```
+
+For a CLI that expects a file, the monitor writes a distinct UTF-8 (no BOM)
+prompt file in the external state directory and supplies it as a separate
+argument, after the configured flag:
+
+```json
+"runner": {
+  "type": "external",
+  "command": "example-agent",
+  "arguments": ["run"],
+  "promptTransport": "file",
+  "promptFileArgument": "--prompt-file"
+}
+```
+
+The compatible external CLI writes ordinary activity to stdout or stderr. To
+finish, it emits a standalone text line (the last valid line wins):
+
+```text
+WATCHER_OUTCOME: done
+WATCHER_OUTCOME: needs-human
+WATCHER_HUMAN_REQUEST: One concise, sanitized question for the Issue author.
+WATCHER_OUTCOME: failed
+```
+
+`done` is normalized to the existing watcher-side `commit-request` event. The
+watcher still requires process exit, the recorded worktree and branch, an
+unchanged baseline commit, a non-empty diff, and `git diff --check` before it
+creates the local commit and records `done`. `needs-human` may include one
+single-line `WATCHER_HUMAN_REQUEST`; `failed` and a nonzero CLI exit both record
+`failed`. Exit code zero without a valid terminal line records `needs-human`.
+
+Configuration rejects an unknown runner type, an empty command, non-string
+arguments, unsupported prompt transport, or a missing file flag before the
+monitor calculates a launch plan, creates a worktree, or starts a process.
 
 Each record has `version: 1`, `type: "watcher-agent-event"`, and one of these
 event values: `activity` (a redacted `message`), `outcome` (a terminal
 `outcome`, optional `message`, and optional `humanRequest`), or `exit` (an
 `exitCode`). Launch-state processing and `-Follow` consume this normalized
-shape rather than Codex event fields. The Codex runner invokes
+shape rather than vendor event fields. The built-in Codex runner invokes
 `codex exec --sandbox workspace-write --json` and sends the exact prompt over
 standard input, so untrusted Issue content is never assembled into shell
 syntax or a child-process command line.
@@ -126,7 +182,7 @@ Review a no-change plan before enabling or starting anything:
 `-WhatIf` may read the configured GitHub Issues and local Git state to calculate
 the branch and worktree plan, but it never changes GitHub, creates a worktree,
 writes launch metadata, or starts/stops a process. Its output includes the
-computed branch, worktree path, and built-in runner command shape.
+computed branch, worktree path, and configured runner command shape.
 
 To stop one concrete tracked launch without deleting anything:
 
@@ -189,10 +245,11 @@ Do this only with a disposable, ready test Issue and a clean local repository:
 
 ## Self-check
 
-The tests use no network, no Pester, and no real Codex process; a fake runner
-emits JSONL through the Core seam. They create disposable local Git fixtures to
-exercise watcher-side commits. Credential Manager and GitHub requests are also
-replaced by offline test seams.
+The tests use no network, no Pester, and no real Codex or vendor process; fake
+runners emit JSONL through the Core seam and a disposable fake external
+executable exercises both prompt transports. They create disposable local Git
+fixtures to exercise watcher-side commits. Credential Manager and GitHub
+requests are also replaced by offline test seams.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1

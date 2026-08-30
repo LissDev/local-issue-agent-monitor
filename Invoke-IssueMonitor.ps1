@@ -506,7 +506,7 @@ function Invoke-LaunchMonitoring {
         try {
             Write-LaunchEvent 'preflight' $issue 'Checking branch, base repository, and isolated worktree path.'
             $plan = New-IssueLaunchPlan -Issue $issue -Launch $Config.Launch -PriorLaunches $known
-            $runner = New-CodexIssueAgentRunner -Command $Config.Launch.CodexCommand
+            $runner = New-IssueAgentRunnerFromConfiguration -Launch $Config.Launch
             if ($WhatIf) { Write-LaunchEvent 'preflight' $issue ("WhatIf plan: branch={0}; worktree={1}; command={2}" -f $plan.Branch, $plan.WorktreePath, $runner.CommandDescription); continue }
             Find-IssueAgentRunnerCommand -Runner $runner | Out-Null
             New-IssueLaunchWorktree -Plan $plan -Launch $Config.Launch | Out-Null
