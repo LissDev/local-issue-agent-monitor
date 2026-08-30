@@ -1200,12 +1200,17 @@ function Stop-IssueLaunchProcess {
     }
     $expectedStartedAt = if ($null -ne $LaunchMetadata.PSObject.Properties['processStartedAt']) { [string]$LaunchMetadata.processStartedAt } else { '' }
     if ([string]::IsNullOrWhiteSpace($expectedStartedAt)) { throw "Tracked PID $processId has no process identity and will not be stopped." }
+    try {
+        $expected = [DateTimeOffset]::Parse($expectedStartedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    } catch { throw "Tracked PID $processId could not be identity-verified and will not be stopped." }
     if ($null -ne $StopProcessScript) { & $StopProcessScript -ProcessId $processId -ProcessStartedAt $expectedStartedAt }
     else {
         $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-        if ($null -eq $process) { throw "Tracked PID $processId is no longer running and will not be stopped." }
+        # A valid, stored process identity plus a missing PID is safe to record
+        # as interrupted.  Nothing is stopped and every launch artifact stays
+        # intact for manual recovery.
+        if ($null -eq $process) { return [pscustomobject]@{ ProcessId = $processId; Stopped = $false; Missing = $true; WhatIf = $false } }
         try {
-            $expected = [DateTimeOffset]::Parse($expectedStartedAt).ToUniversalTime()
             $actual = [DateTimeOffset]$process.StartTime.ToUniversalTime()
         } catch { throw "Tracked PID $processId could not be identity-verified and will not be stopped." }
         if ([Math]::Abs(($actual - $expected).TotalSeconds) -ge 1) { throw "Tracked PID $processId was reused by another process and will not be stopped." }
@@ -1621,9 +1626,17 @@ function ConvertTo-MonitoredIssue {
     $labels = @($rawLabels | ForEach-Object {
         if ($_ -is [string]) { $_ } elseif ($null -ne $_ -and $null -ne $_.PSObject.Properties['name']) { [string]$_.name }
     } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
-    $updatedAt = [DateTimeOffset]::MinValue
     $rawUpdatedAt = if ($null -ne $Issue.PSObject.Properties['updated_at']) { $Issue.updated_at } else { $null }
-    if (-not [DateTimeOffset]::TryParse([string]$rawUpdatedAt, [ref]$updatedAt)) {
+    $updatedAt = [DateTimeOffset]::MinValue
+    if ($rawUpdatedAt -is [DateTimeOffset]) {
+        $updatedAt = ([DateTimeOffset]$rawUpdatedAt).ToUniversalTime()
+    }
+    elseif ($rawUpdatedAt -is [DateTime]) {
+        $timestamp = [DateTime]$rawUpdatedAt
+        if ($timestamp.Kind -eq [DateTimeKind]::Unspecified) { $timestamp = [DateTime]::SpecifyKind($timestamp, [DateTimeKind]::Utc) }
+        $updatedAt = ([DateTimeOffset]$timestamp).ToUniversalTime()
+    }
+    elseif (-not [DateTimeOffset]::TryParse([string]$rawUpdatedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$updatedAt)) {
         throw "GitHub returned an Issue with an invalid updated_at value for '$Repository' #$number."
     }
     $url = if ($null -ne $Issue.PSObject.Properties['html_url'] -and $Issue.html_url) { [string]$Issue.html_url } elseif ($null -ne $Issue.PSObject.Properties['url']) { [string]$Issue.url } else { '' }

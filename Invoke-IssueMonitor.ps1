@@ -68,7 +68,7 @@ function Get-ActivityMonitorCompletionSummary {
     return @($counts.GetEnumerator() | Sort-Object Name | ForEach-Object { [pscustomobject]@{ Repository = $_.Name; Count = [int]$_.Value } })
 }
 function Remove-ClosedIssueLaunches {
-    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][object[]]$Issues)
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Issues)
     $closedIssues = @{}
     foreach ($issue in $Issues) {
         if ($null -ne $issue -and [string]$issue.State -eq 'closed') { $closedIssues[('{0}#{1}' -f $issue.Repository, $issue.Number)] = $issue }
@@ -110,9 +110,13 @@ function Get-DisplayText {
 function Write-IssueMonitorEvent {
     param([Parameter(Mandatory)]$Event)
     $time = Format-MonitorLocalTime ([DateTimeOffset]::UtcNow)
-    if ($Event.Status -eq 'error') {
+    # Poll failures intentionally have no Issue payload.  Keep this guard
+    # defensive so an incomplete event can never turn error rendering into a
+    # secondary Labels-property failure.
+    if ($Event.Status -eq 'error' -or $null -eq $Event.Issue) {
         $repository = if ($Event.Repository) { $Event.Repository } else { '-' }
-        $line = '{0} | {1,-12} | {2,-35} | {3}' -f $time, 'error', $repository, (Protect-MonitorText $Event.Message)
+        $message = if ($Event.PSObject.Properties['Message']) { [string]$Event.Message } else { 'Monitor event did not include an Issue payload.' }
+        $line = '{0} | {1,-12} | {2,-35} | {3}' -f $time, 'error', $repository, (Protect-MonitorText $message)
         if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }; return
     }
     $issue = $Event.Issue; $labels = @($issue.Labels) -join ', '
@@ -439,7 +443,7 @@ function Invoke-LaunchMonitoring {
     }
     $state = Read-IssueLaunchState -Path $Config.Launch.StatePath; $stateChanged = $false
     $issuesByKey = @{}
-    foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
+    foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' -and $null -ne $_.Issue })) {
         $issuesByKey[('{0}#{1}' -f $event.Issue.Repository, $event.Issue.Number)] = $event.Issue
     }
     $closedLaunches = Remove-ClosedIssueLaunches -State $state -Issues @($issuesByKey.Values)
@@ -454,16 +458,17 @@ function Invoke-LaunchMonitoring {
             if ([string]$launch.status -in @('done', 'needs-human', 'failed')) {
                 $currentIssue = $issuesByKey[([string]$launch.issue)]
                 $isExplicitRetry = $null -ne $currentIssue -and @($currentIssue.Labels | Where-Object { $_ -eq 'agent:run' }).Count -gt 0 -and ([string]$launch.status -in @('done', 'needs-human', 'failed'))
-                if (-not $isExplicitRetry) {
-                    if (Invoke-LaunchLabelTransition $keyIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
+                if ($null -ne $currentIssue -and -not $isExplicitRetry) {
+                    if (Invoke-LaunchLabelTransition $currentIssue $launch $Config ([string]$launch.status) $GitHubToken) { $stateChanged = $true }
                 }
-                if ([string]$launch.status -eq 'needs-human') {
-                    if (Publish-LaunchHumanRequestComment $keyIssue $launch $Config $GitHubToken) { $stateChanged = $true }
+                if ($null -ne $currentIssue -and [string]$launch.status -eq 'needs-human') {
+                    if (Publish-LaunchHumanRequestComment $currentIssue $launch $Config $GitHubToken) { $stateChanged = $true }
                 }
             }
             continue
         }
-        if (Invoke-LaunchLabelTransition $keyIssue $launch $Config 'running' $GitHubToken) { $stateChanged = $true }
+        $currentIssue = $issuesByKey[([string]$launch.issue)]
+        if ($null -ne $currentIssue -and (Invoke-LaunchLabelTransition $currentIssue $launch $Config 'running' $GitHubToken)) { $stateChanged = $true }
         $jsonl = Get-LaunchJsonlStatus $launch
         if ($jsonl.Status -ne 'running') {
             # A final response can reach JSONL shortly before its runner-exit
@@ -489,9 +494,9 @@ function Invoke-LaunchMonitoring {
             }
             if ($terminalStatus -eq 'done') { Add-ActivityMonitorCompletedIssue $keyIssue }
             Write-LaunchEvent $terminalStatus $keyIssue $terminalDetail
-            if ($terminalStatus -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $keyIssue $launch $Config $terminalStatus $GitHubToken) { $stateChanged = $true } }
-            if ($terminalStatus -eq 'needs-human') {
-                if (Publish-LaunchHumanRequestComment $keyIssue $launch $Config $GitHubToken) { $stateChanged = $true }
+            if ($null -ne $currentIssue -and $terminalStatus -in @('done', 'needs-human', 'failed')) { if (Invoke-LaunchLabelTransition $currentIssue $launch $Config $terminalStatus $GitHubToken) { $stateChanged = $true } }
+            if ($null -ne $currentIssue -and $terminalStatus -eq 'needs-human') {
+                if (Publish-LaunchHumanRequestComment $currentIssue $launch $Config $GitHubToken) { $stateChanged = $true }
             }
         }
     }
@@ -509,7 +514,7 @@ function Invoke-LaunchMonitoring {
         Write-LaunchEvent 'interrupted' $keyIssue 'PID is no longer identity-verified. The monitor will not restart it; choose recovery manually.'
     }
     if ($stateChanged -and -not $WhatIf) { Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath }
-    foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' })) {
+    foreach ($event in @($PollResult.Events | Where-Object { $_.Status -ne 'error' -and $null -ne $_.Issue })) {
         $issue = $event.Issue; $known = @(Find-IssueLaunchMetadata -State $state -Repository $issue.Repository -IssueNumber $issue.Number)
         if (@($known | Where-Object { [string]$_.status -eq 'running' }).Count -gt 0) { continue }
         $eligibility = Get-IssueLaunchEligibility -Issue $issue -Launch $Config.Launch
@@ -545,7 +550,7 @@ function Invoke-LaunchMonitoring {
     }
 }
 function Invoke-MonitorIteration {
-    param([scriptblock]$CredentialReadScript, [scriptblock]$CredentialProviderScript, $ResolvedConfig)
+    param([scriptblock]$CredentialReadScript, [scriptblock]$CredentialProviderScript, [scriptblock]$InvokeRestMethodScript, [scriptblock]$MonitorMessageScript, $ResolvedConfig)
     try { $config = if ($null -ne $ResolvedConfig) { $ResolvedConfig } else { Get-IssueMonitorConfig -Path $ConfigPath } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false; Config = $null } }
     if ($PSCmdlet.ParameterSetName -eq 'Stop') {
         try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
@@ -553,8 +558,12 @@ function Invoke-MonitorIteration {
     try {
         $gitHubToken = Get-GitHubIssuesToken -CredentialProvider $config.CredentialProvider -CredentialProviderScript $CredentialProviderScript -CredentialReadScript $CredentialReadScript
         $noStateWrite = [bool]$WhatIf -or -not [bool]$config.Launch.Enabled
-        $result = Invoke-IssueMonitorPoll -Config $config -GitHubToken $gitHubToken -DoNotSaveState:$noStateWrite; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result $gitHubToken
-        if ($result.SuccessfulRepositoryCount -eq 0) { Write-MonitorMessage 'No repository could be checked. Review the error rows above; local state was not changed.'; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
+        $result = Invoke-IssueMonitorPoll -Config $config -GitHubToken $gitHubToken -DoNotSaveState:$noStateWrite -InvokeRestMethodScript $InvokeRestMethodScript; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result $gitHubToken
+        if ($result.SuccessfulRepositoryCount -eq 0) {
+            $allErrorMessage = 'No repository could be checked. Review the error rows above; GitHub Issue and label state was not updated. Local launch JSONL may still have been reconciled.'
+            if ($null -ne $MonitorMessageScript) { & $MonitorMessageScript -Message $allErrorMessage -Status 'error' } else { Write-MonitorMessage $allErrorMessage }
+            return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config; Message = $allErrorMessage }
+        }
         return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config }
     } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
 }
