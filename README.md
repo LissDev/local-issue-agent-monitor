@@ -5,6 +5,12 @@ isolated, headless agent CLI process when a ready Issue is explicitly marked
 `agent:run`. It creates a local commit only after an explicit validated agent
 request; it never pushes, opens pull requests, merges, or deletes worktrees.
 
+It is designed for Windows users who run subscription-backed local coding
+agents with an interactive sign-in, especially when their plan does not provide
+API access and the agent therefore cannot be run through GitHub Actions. The
+monitor keeps that agent work on the local machine while using GitHub Issues as
+the explicit task queue.
+
 ## Safety envelope
 
 A launch is permitted only when all of these are true:
