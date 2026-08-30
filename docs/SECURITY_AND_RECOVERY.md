@@ -76,8 +76,13 @@ equals the stored launch baseline, requires a non-empty diff, and runs `git diff
 --check` before staging and committing. A validation or commit failure records
 `needs-human` and preserves the worktree for recovery. The watcher never pushes,
 creates pull requests, merges, or makes another remote Git write. A normal exit
-without the marker and an agent clarification also record `needs-human`.
-Explicit failure, a nonzero child exit, and launch errors record `failed`.
+without the marker records `needs-human`.
+An agent clarification is recognized only when a valid agent message includes
+both `WATCHER_HUMAN_REQUEST:` and `WATCHER_OUTCOME: needs-human`. The watcher
+sanitizes that single-line request and posts it once as an `[Agent status update]`
+comment; the agent process never uses GitHub credentials or a GitHub client.
+Incidental log text is not a clarification request. Explicit failure, a nonzero
+child exit, and launch errors record `failed`.
 
 ## First actual launch checklist
 
