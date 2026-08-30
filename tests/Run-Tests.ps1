@@ -138,6 +138,154 @@ try {
     Assert-Equal $mixedPoll.Events[0].Status 'error' 'A failed repository is reported as an error event'
     Assert-True ($mixedPoll.Events[0].Message -match 'rate limit') 'Rate-limit errors are understandable'
 
+    # v1 launch eligibility is opt-in and requires the exact label envelope.
+    $repositoryPath = Join-Path $temporaryRoot 'source-repository'
+    $worktreeRoot = Join-Path $temporaryRoot 'worktrees'
+    $launchStatePath = Join-Path $temporaryRoot 'external-state\launches.json'
+    $enabledLaunch = [pscustomobject]@{
+        Enabled = $true; WorktreeDirectory = $worktreeRoot; StatePath = $launchStatePath
+        RepositoryPaths = @{ 'example-org/example-repo' = $repositoryPath }; CodexCommand = 'fake-codex'
+    }
+    $disabledLaunch = [pscustomobject]@{
+        Enabled = $false; WorktreeDirectory = $null; StatePath = $launchStatePath
+        RepositoryPaths = @{}; CodexCommand = 'fake-codex'
+    }
+    $launchIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 77 -Title 'Safe isolated launch' -Labels @('type:feat', 'status:ready', 'agent:run'))
+    Assert-Equal (Get-IssueLaunchEligibility -Issue $launchIssue -Launch $disabledLaunch).Reason 'launch-disabled' 'Disabled launch never becomes eligible'
+    Assert-True (Get-IssueLaunchEligibility -Issue $launchIssue -Launch $enabledLaunch).Eligible 'The full launch label envelope is eligible'
+    $missingType = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 78 -Labels @('status:ready', 'agent:run'))
+    Assert-Equal (Get-IssueLaunchEligibility -Issue $missingType -Launch $enabledLaunch).Reason 'requires-exactly-one-type-label' 'A type label is mandatory'
+    $twoTypes = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 79 -Labels @('type:feat', 'type:fix', 'status:ready', 'agent:run'))
+    Assert-Equal (Get-IssueLaunchEligibility -Issue $twoTypes -Launch $enabledLaunch).Reason 'requires-exactly-one-type-label' 'Two type labels are rejected'
+    Assert-Equal (New-IssueLaunchBranch -Type 'feat' -IssueNumber 77 -ShortName 'Safe isolated launch!') 'feat/issue-77/safe-isolated-launch' 'The branch name follows the required v1 format'
+
+    # Every Git and filesystem operation below is an injected fake.  No real
+    # repository, worktree, command, network request, or Codex process is used.
+    $script:fakeGitCalls = @()
+    $fakeGit = {
+        param($RepositoryPath, $Arguments)
+        $script:fakeGitCalls += ($Arguments -join ' ')
+        if ($Arguments[0] -eq 'branch' -and $Arguments -contains '--show-current') { return @('main') }
+        return @()
+    }
+    $fakePath = {
+        param($Path, $PathType)
+        if ($PathType -eq 'Any') { return $false }
+        return $true
+    }
+    $plan = New-IssueLaunchPlan -Issue $launchIssue -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    Assert-True $plan.Eligible 'Preflight produces a plan without mutation'
+    Assert-Equal $plan.Branch 'feat/issue-77/safe-isolated-launch' 'Preflight uses the computed branch'
+    Assert-True ($plan.WorktreePath -match 'example-org-example-repo.*issue-77') 'Preflight uses a repository-scoped worktree path'
+    Assert-True ($plan.Prompt -notmatch [regex]::Escape($launchIssue.Title)) 'Untrusted Issue title is excluded from the Codex prompt'
+    Assert-True ($plan.Prompt -match 'Issue URL: https://github.com/example-org/example-repo/issues/77') 'Prompt contains only the canonical Issue reference'
+    Assert-True ($plan.Prompt -match 'read AGENTS\.md') 'Prompt requires the agent to read repository rules before edits'
+    $worktree = New-IssueLaunchWorktree -Plan $plan -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    Assert-True $worktree.Created 'Fake Git receives a worktree creation request only after preflight'
+    Assert-True (@($script:fakeGitCalls | Where-Object { $_ -match '^worktree add -b ' }).Count -eq 1) 'Exactly one fake worktree add is issued'
+
+    # The fake process seam stands in for codex exec --json.  It writes a JSONL
+    # fixture but never starts a real child process or external executable.
+    New-Item -ItemType Directory -Path $plan.WorktreePath -Force | Out-Null
+    $stateDirectory = Split-Path -Path $launchStatePath -Parent
+    $logPath = Join-Path $stateDirectory 'issue-77-fake.jsonl'
+    $script:fakeRunnerCalls = 0
+    $fakeRunner = {
+        param($Prompt, $LogPath, $StateDirectory, $WorkingDirectory, $CodexCommand)
+        $script:fakeRunnerCalls++
+        $script:fakeRunnerWorkingDirectory = $WorkingDirectory
+        if (-not (Test-Path -LiteralPath $StateDirectory)) { New-Item -ItemType Directory -Path $StateDirectory -Force | Out-Null }
+        [IO.File]::WriteAllText($LogPath, '{"type":"completed","message":"token=[redacted]"}')
+        [pscustomobject]@{ Id = 867; RunnerPath = 'fake-runner.ps1'; LogPath = $LogPath; StartedAt = [DateTimeOffset]::Parse('2026-08-30T12:00:00Z') }
+    }
+    $fakeProcess = Start-IssueLaunchProcess -Prompt $plan.Prompt -LogPath $logPath -StateDirectory $stateDirectory -WorkingDirectory $plan.WorktreePath -CodexCommand 'fake-codex' -StartProcessScript $fakeRunner
+    Assert-Equal $script:fakeRunnerCalls 1 'The injected fake runner is used exactly once'
+    Assert-Equal $fakeProcess.Id 867 'Fake runner supplies the tracked PID'
+    Assert-Equal $script:fakeRunnerWorkingDirectory $plan.WorktreePath 'The fake runner is confined to the newly created worktree'
+    $coreSource = Get-Content -LiteralPath (Join-Path $projectRoot 'src\IssueMonitor.Core.psm1') -Raw
+    Assert-True ($coreSource -match 'function Protect-LaunchLogLine') 'The generated runner redacts credential-shaped JSONL values before writing its external log'
+    $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
+    Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
+    Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'
+    $launchState = [pscustomobject]@{ version = 1; launches = @($metadata) }
+    Save-IssueLaunchState -State $launchState -Path $launchStatePath
+    $loadedLaunchState = Read-IssueLaunchState -Path $launchStatePath
+    Assert-Equal @(Find-IssueLaunchMetadata -State $loadedLaunchState -Repository 'example-org/example-repo' -IssueNumber 77).Count 1 'A tracked Issue is deduplicated by repository and number'
+    $reconciledAlive = Reconcile-IssueLaunchState -State $loadedLaunchState -ProcessIsAliveScript { param($ProcessId, $ProcessStartedAt) $ProcessId -eq 867 -and $ProcessStartedAt -eq '2026-08-30T12:00:00.0000000+00:00' }
+    Assert-True (-not $reconciledAlive.Changed) 'A live fake PID remains running'
+    $reconciledMissing = Reconcile-IssueLaunchState -State $loadedLaunchState -ProcessIsAliveScript { param($ProcessId, $ProcessStartedAt) $false }
+    Assert-True $reconciledMissing.Changed 'A missing PID is recorded as interrupted and never restarted'
+    Assert-Equal $reconciledMissing.State.launches[0].status 'interrupted' 'Missing PID transition is interrupted'
+
+    # Agent label writes are isolated behind a seam and are skipped for disabled
+    # launch and plan-only mode.
+    $script:labelCalls = 0
+    $fakeLabel = { param($Repository, $IssueNumber, $RemoveLabel, $AddLabel) $script:labelCalls++; $script:lastRemovedLabel = $RemoveLabel; $script:lastAddedLabel = $AddLabel }
+    $whatIfLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -WhatIf -LabelRequestScript $fakeLabel
+    Assert-Equal $whatIfLabel.Reason 'what-if' 'WhatIf does not call the GitHub label seam'
+    Assert-Equal $script:labelCalls 0 'No label write occurs in WhatIf'
+    $disabledLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $disabledLaunch -Status 'running' -LabelRequestScript $fakeLabel
+    Assert-Equal $disabledLabel.Reason 'launch-disabled' 'Disabled launch does not call the GitHub label seam'
+    $actualLabel = Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'running' -LabelRequestScript $fakeLabel
+    Assert-True $actualLabel.Requested 'Enabled launch invokes only the injected label seam'
+    Assert-Equal $script:labelCalls 1 'The fake label seam is called once after the fake start'
+    Assert-Equal $script:lastRemovedLabel 'agent:run' 'The initial transition removes only agent:run'
+    Assert-Equal $script:lastAddedLabel 'agent:running' 'The initial transition adds agent:running'
+    Request-IssueLaunchAgentLabel -Issue $launchIssue -Launch $enabledLaunch -Status 'done' -LabelRequestScript $fakeLabel | Out-Null
+    Assert-Equal $script:lastRemovedLabel 'agent:running' 'A terminal transition replaces agent:running'
+    Assert-Equal $script:lastAddedLabel 'agent:done' 'A terminal transition adds only agent:done'
+
+    # The real Git fixture is entirely under the temporary test directory.  It
+    # verifies that a clean local repository receives a genuinely isolated
+    # worktree while the runner remains fake.
+    $gitFixturePath = Join-Path $temporaryRoot 'git-fixture'
+    $gitFixtureWorktrees = Join-Path $temporaryRoot 'git-fixture-worktrees'
+    $gitFixtureState = Join-Path $temporaryRoot 'git-fixture-state\launches.json'
+    New-Item -ItemType Directory -Path $gitFixturePath -Force | Out-Null
+    & git init --quiet $gitFixturePath
+    & git -C $gitFixturePath config user.email 'fixture@example.invalid'
+    & git -C $gitFixturePath config user.name 'Issue Monitor Fixture'
+    [IO.File]::WriteAllText((Join-Path $gitFixturePath 'README.md'), 'fixture')
+    & git -C $gitFixturePath add README.md
+    & git -C $gitFixturePath commit --quiet -m 'fixture'
+    New-Item -ItemType Directory -Path $gitFixtureWorktrees -Force | Out-Null
+    $fixtureLaunch = [pscustomobject]@{ Enabled = $true; WorktreeDirectory = $gitFixtureWorktrees; StatePath = $gitFixtureState; RepositoryPaths = @{ 'example-org/example-repo' = $gitFixturePath }; CodexCommand = 'fake-codex' }
+    $fixturePlan = New-IssueLaunchPlan -Issue $launchIssue -Launch $fixtureLaunch
+    $fixtureWorktree = New-IssueLaunchWorktree -Plan $fixturePlan -Launch $fixtureLaunch
+    Assert-True $fixtureWorktree.Created 'A disposable local Git repository gets an isolated worktree'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fixtureWorktree.Path '.git')) 'The disposable worktree is a Git checkout'
+    Assert-Equal (& git -C $fixtureWorktree.Path branch --show-current) $fixturePlan.Branch 'The disposable worktree uses the exact computed branch'
+
+    $readOnlyStatePath = Join-Path $temporaryRoot 'read-only-poll.json'
+    Invoke-IssueMonitorPoll -Config $emptyPollConfig -StatePath $readOnlyStatePath -DoNotSaveState -InvokeRestMethodScript {
+        param($Uri, $Headers, $Repository) [pscustomobject]@{ Items = @(New-RawIssue -Number 80); Headers = @{} }
+    } | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath $readOnlyStatePath)) 'A successful read-only poll writes no normal monitor state'
+
+    # Source the CLI against a disabled test configuration.  The invocation has
+    # no token, performs no network call, and proves its WhatIf path does not
+    # create a worktree, launch state, or child process.  Its JSONL renderer is
+    # then checked for terminal states and secret redaction.
+    $cliConfigPath = Join-Path $temporaryRoot 'cli-disabled.json'
+    $cliStatePath = Join-Path $temporaryRoot 'cli-no-write\launches.json'
+    $cliConfig = [pscustomobject]@{
+        repositories = @('example-org/example-repo'); pollIntervalSeconds = 60; watchedLabels = @('status:ready')
+        launch = [pscustomobject]@{ enabled = $false; worktreeDirectory = (Join-Path $temporaryRoot 'cli-no-write\worktrees'); statePath = $cliStatePath; codexCommand = 'fake-codex'; repositoryPaths = @{} }
+    }
+    [IO.File]::WriteAllText($cliConfigPath, ($cliConfig | ConvertTo-Json -Depth 5))
+    $env:GITHUB_ISSUES_TOKEN = ''
+    . (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $cliConfigPath -WhatIf
+    Assert-True (-not (Test-Path -LiteralPath (Split-Path -Path $cliStatePath -Parent))) 'CLI WhatIf with disabled launch creates no launch-state directory'
+    $jsonlFixture = Join-Path $temporaryRoot 'render.jsonl'
+    [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"needs-human`",`"message`":`"Authorization: Bearer github_pat_secret_value`"}")
+    $rendered = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
+    Assert-Equal $rendered.Status 'needs-human' 'JSONL maps a human intervention event to needs-human'
+    Assert-True ($rendered.Detail -notmatch 'github_pat_secret_value') 'JSONL credentials are redacted before display'
+    [IO.File]::WriteAllText($jsonlFixture, '{"type":"completed"}')
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'done' 'JSONL completion maps to done'
+    [IO.File]::WriteAllText($jsonlFixture, '{"error":"failed"}')
+    Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'failed' 'JSONL errors map to failed'
+
     Write-Host "PASS: $script:assertions assertions succeeded (no network requests)."
 }
 finally {

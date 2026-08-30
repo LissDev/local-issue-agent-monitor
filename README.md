@@ -1,81 +1,128 @@
 # local-issue-agent-monitor
 
-`v0` is a local PowerShell monitor for GitHub Issues in one or more
-repositories. It only reads Issues through the GitHub REST API and displays
-work-ready tasks. It does not start Codex, create worktrees, or run GitHub
-Actions.
+`v1` is a local PowerShell monitor for GitHub Issues.  It can start one
+isolated, headless Codex CLI process when a ready Issue is explicitly marked
+`agent:run`.  The monitor creates no commits, pushes, pull requests, merges, or
+worktree deletions.
+
+## Safety envelope
+
+A launch is permitted only when all of these are true:
+
+- `launch.enabled` is `true` in the local (ignored) configuration;
+- the Issue has exactly one `type:*` label, plus `status:ready` and `agent:run`;
+- the configured local repository is clean and on a branch;
+- the calculated branch does not already exist; and
+- the calculated worktree path does not exist or belong to Git already.
+
+The branch is always `<type>/issue-<number>/<short-name>`.  Each launch gets a
+new worktree below `launch.worktreeDirectory`; an existing branch or worktree is
+never reused, overwritten, or removed.  Issue content is treated as untrusted:
+the agent receives only its number, canonical URL, fixed boundaries, acceptance
+criteria, and manual-verification request.
 
 ## Installation and configuration
 
-Windows PowerShell 5.1 or PowerShell 7+ and access to the GitHub API are
-required. No external modules are needed.
+Windows PowerShell 5.1 or PowerShell 7+, Git, Codex CLI, and GitHub access are
+required.  No external PowerShell modules or OpenAI API key are used.
 
-Copy the example to a local configuration file. The local file is intentionally
-ignored by Git:
+Copy the example and replace every example path with an absolute local path:
 
 ```powershell
 Copy-Item .\config.example.json .\config.json
 ```
 
-In `config.json`, list the repository or repositories to monitor in the
-`repositories` array. The example already includes the `status:ready` label.
-You can later add, for example, `agent:run` to `watchedLabels`.
+Keep `launch.enabled` as `false` until the plan and paths have been reviewed.
+For each monitored repository, add a matching entry in
+`launch.repositoryPaths`; the worktree and state paths must be outside that
+repository.  The example is deliberately non-runnable until these paths are
+changed.
 
-In the same PowerShell window, set a GitHub token that can read Issues:
+Set `GITHUB_ISSUES_TOKEN` in the PowerShell window only.  Use a fine-grained
+token limited to the monitored repositories with **Issues: Read and write**:
+read access lists Issues, and write access changes only the monitor's
+`agent:*` labels after an actual process start or terminal result.
 
 ```powershell
 $env:GITHUB_ISSUES_TOKEN = 'github_pat_...'
 ```
 
-The token is stored only in the current process environment: never in the
-configuration, local state, logs, or program output. Use a fine-grained token
-restricted to the required repositories with only the **Issues: Read**
-permission.
+The Codex CLI must already be signed in with the user's ChatGPT subscription.
+This monitor does not use an OpenAI API key, API billing, or a copied desktop
+session.
 
-## Running the monitor
+## Monitor modes
 
-Run one check (the default mode):
+One poll is the default:
 
 ```powershell
 .\Invoke-IssueMonitor.ps1 -Once
 ```
 
-Run continuously in a separate PowerShell window opened by the user:
+Watch continuously:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-IssueMonitor.ps1 -Watch
 ```
 
-To use a different configuration file, pass `-ConfigPath`:
+Review a no-change plan before enabling or starting anything:
 
 ```powershell
-.\Invoke-IssueMonitor.ps1 -ConfigPath C:\secure\issue-monitor.json -Once
+.\Invoke-IssueMonitor.ps1 -ConfigPath C:\secure\issue-monitor.json -WhatIf
 ```
 
-The output includes event time, status, repository, Issue number, type
-(`issue`), labels, update time, and title. Issues carrying `status:ready` are
-also marked as ready.
+`-WhatIf` may read the configured GitHub Issues and local Git state to calculate
+the branch and worktree plan, but it never changes GitHub, creates a worktree,
+writes launch metadata, or starts/stops a process.  Its output includes the
+computed branch, worktree path, and `codex exec --json` command shape.
 
-Local state is stored outside the repository at
-`%LOCALAPPDATA%\local-issue-agent-monitor\state.json`. Therefore, an unchanged
-Issue is reported as `already-seen` on a later poll; an Issue update or a newly
-added watched label produces `updated` or `ready`.
+To stop one concrete tracked launch without deleting anything:
 
-## Errors and v0 limitations
+```powershell
+.\Invoke-IssueMonitor.ps1 -StopIssue example-org/example-repo#42
+```
 
-If `GITHUB_ISSUES_TOKEN` is missing, JSON is invalid, or configuration fields
-are invalid, the script prints an instruction without exposing the secret. In
-`-Watch` mode, temporary network errors and GitHub API rate limits do not stop
-monitoring: the reason and the next attempt time in UTC are displayed.
+This stops only the stored PID and records `interrupted`; it preserves the
+branch, worktree, logs, and agent result for human recovery.  Add `-WhatIf` to
+print the target without stopping it.
 
-`v0` does not create worktrees, run Codex or Actions, create commits or push,
-use webhooks, a Windows service, Task Scheduler, a web UI, a database, multiple
-accounts, or models. Issue text is not sent anywhere other than the GitHub API
-request and local console output.
+## Statuses and recovery
+
+The console shows normal Issue rows plus launch statuses: `queued`, `preflight`,
+`running`, `needs-human`, `done`, `failed`, and `interrupted`.  JSONL emitted by
+Codex is written to the external state directory and summarized without printing
+credentials.  A process that has disappeared becomes `interrupted`; it is never
+restarted automatically.  Inspect the preserved worktree and log, then decide
+whether to continue manually or create a new Issue/launch request.
+
+On a successful actual start the monitor changes `agent:run` to `agent:running`.
+At a terminal JSONL status it changes only that agent label to `agent:done`,
+`agent:needs-human`, or `agent:failed`.  A GitHub label failure is reported but
+does not stop or delete the local process.
+
+See [security and recovery guidance](docs/SECURITY_AND_RECOVERY.md) for token,
+log, and first-run details.
+
+## First actual launch
+
+Do this only with a disposable, ready test Issue and a clean local repository:
+
+1. Copy `config.example.json`, set absolute paths, and leave `launch.enabled`
+   false.
+2. Set the scoped read/write GitHub token and confirm `codex` is signed in with
+   the intended ChatGPT subscription.
+3. Run `-WhatIf` and verify the displayed branch and new worktree path.
+4. Change only `launch.enabled` to `true`; put exactly `type:feat`,
+   `status:ready`, and `agent:run` on the test Issue.
+5. Run `-Once`, observe `queued`, `preflight`, and `running`, and check that the
+   Issue label became `agent:running`.
+6. Keep the monitor running to observe its terminal status, or use `-StopIssue`
+   for a deliberate safe interruption.
 
 ## Self-check
 
-The tests do not use the network and do not require Pester:
+The tests use no network, no Pester, no real Git, and no real Codex process; a
+fake runner emits JSONL through the Core seam.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1

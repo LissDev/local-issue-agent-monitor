@@ -4,6 +4,16 @@
   ],
   "pollIntervalSeconds": 60,
   "watchedLabels": [
-    "status:ready"
-  ]
+    "status:ready",
+    "agent:run"
+  ],
+  "launch": {
+    "enabled": false,
+    "worktreeDirectory": "C:\\IssueAgentWorktrees",
+    "statePath": "C:\\Users\\YOUR_NAME\\AppData\\Local\\local-issue-agent-monitor\\launches.json",
+    "repositoryPaths": {
+      "example-org/example-repo": "C:\\src\\example-repo"
+    },
+    "codexCommand": "codex"
+  }
 }
