@@ -370,6 +370,27 @@ try {
     $rendered = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })
     Assert-Equal $rendered.Status 'needs-human' 'JSONL maps a human intervention event to needs-human'
     Assert-True ($rendered.Detail -notmatch 'github_pat_secret_value') 'JSONL credentials are redacted before display'
+    Assert-True ($rendered.Activity -notmatch 'github_pat_secret_value') 'Latest JSONL activity is redacted before display'
+    $monitorRows = @(Get-ActivityMonitorRows ([pscustomobject]@{ launches = @(
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 100; status = 'interrupted'; pid = 5432; logPath = '' }
+    ) }))
+    Assert-Equal $monitorRows.Count 2 'The activity monitor renders every tracked launch'
+    Assert-Equal $monitorRows[0].Repository 'example-org/example-repo' 'Activity rows include the repository'
+    Assert-Equal $monitorRows[0].Issue 99 'Activity rows include the Issue number'
+    Assert-Equal $monitorRows[0].Pid '4321' 'Activity rows include the tracked PID'
+    Assert-Equal $monitorRows[1].Status 'interrupted' 'Activity rows preserve interrupted terminal status'
+    Assert-True ($monitorRows[1].Activity -match 'manual recovery') 'Interrupted rows explain the recovery state'
+    $snapshotStatePath = Join-Path $temporaryRoot 'activity-monitor\launches.json'
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @(
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 100; status = 'interrupted'; pid = 5432; logPath = '' }
+    ) }) -Path $snapshotStatePath
+    $snapshotConfig = [pscustomobject]@{ Launch = [pscustomobject]@{ Enabled = $true; StatePath = $snapshotStatePath } }
+    $snapshot = (& { Write-ActivityMonitorSnapshot -Config $snapshotConfig -Iteration ([pscustomobject]@{ PollIntervalSeconds = 60 }) } 6>&1 | Out-String)
+    Assert-True ($snapshot -match 'live agent activity' -and $snapshot -match 'Latest activity UTC') 'Watch mode renders a current activity snapshot'
+    Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
+    Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
     [IO.File]::WriteAllText($jsonlFixture, '{"type":"item.completed","item":{"type":"agent_message","text":"Implementation complete. WATCHER_OUTCOME: done"}}' + "`n" + '{"type":"watcher-runner-exit","exitCode":0}')
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'done' 'Only an explicit done marker maps to done before the commit gate'
     [IO.File]::WriteAllText($jsonlFixture, "{`"type`":`"completed`"}`n{`"type`":`"watcher-runner-exit`",`"exitCode`":0}")

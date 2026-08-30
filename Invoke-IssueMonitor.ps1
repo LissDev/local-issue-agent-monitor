@@ -15,6 +15,12 @@ $modulePath = Join-Path $PSScriptRoot 'src\IssueMonitor.Core.psm1'
 if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) { throw "The core module was not found at '$modulePath'." }
 Import-Module -Name $modulePath -Force
 
+# Watch mode collects the normal lifecycle messages during a poll, then renders
+# them as part of one refreshed snapshot.  One-off and Stop modes keep their
+# existing line-oriented output.
+$script:IsActivityMonitor = [bool]$Watch
+$script:ActivityMonitorNotices = [System.Collections.Generic.List[string]]::new()
+
 function Protect-MonitorText {
     param([AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
@@ -25,7 +31,16 @@ function Protect-MonitorText {
     $safe = $safe -replace '(?i)(authorization|token)\s*[:=]\s*[^\s,;"'']+', '$1=[redacted]'
     return $safe
 }
-function Write-MonitorMessage { param([Parameter(Mandatory)][string]$Message, [string]$Status = 'error'); Write-Host ('{0:u} | {1,-12} | {2}' -f [DateTimeOffset]::UtcNow, $Status, (Protect-MonitorText $Message)) }
+function Add-ActivityMonitorNotice {
+    param([Parameter(Mandatory)][string]$Message)
+    if ($script:IsActivityMonitor) { [void]$script:ActivityMonitorNotices.Add((Protect-MonitorText $Message)) }
+}
+function Write-MonitorMessage {
+    param([Parameter(Mandatory)][string]$Message, [string]$Status = 'error')
+    $line = '{0:u} | {1,-12} | {2}' -f [DateTimeOffset]::UtcNow, $Status, (Protect-MonitorText $Message)
+    if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line; return }
+    Write-Host $line
+}
 function Get-DisplayText {
     param([AllowNull()][string]$Text, [int]$MaximumLength = 60)
     $safe = Protect-MonitorText $Text
@@ -38,31 +53,40 @@ function Write-IssueMonitorEvent {
     $time = [DateTimeOffset]::UtcNow.ToString('u')
     if ($Event.Status -eq 'error') {
         $repository = if ($Event.Repository) { $Event.Repository } else { '-' }
-        Write-Host ('{0} | {1,-12} | {2,-35} | {3}' -f $time, 'error', $repository, (Protect-MonitorText $Event.Message)); return
+        $line = '{0} | {1,-12} | {2,-35} | {3}' -f $time, 'error', $repository, (Protect-MonitorText $Event.Message)
+        if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }; return
     }
     $issue = $Event.Issue; $labels = @($issue.Labels) -join ', '
     if ([string]::IsNullOrWhiteSpace($labels)) { $labels = '-' }
     $ready = if ($Event.IsWatched) { ' READY' } else { '' }
     $format = '{0} | {1,-12} | {2,-35} | #{3,-6} | {4,-14} | {5,-28} | {6,-20} | {7}{8}'
-    Write-Host ($format -f $time, $Event.Status, $issue.Repository, $issue.Number, $issue.Type, (Get-DisplayText $labels 28), $issue.UpdatedAt, (Get-DisplayText $issue.Title), $ready)
+    $line = $format -f $time, $Event.Status, $issue.Repository, $issue.Number, $issue.Type, (Get-DisplayText $labels 28), $issue.UpdatedAt, (Get-DisplayText $issue.Title), $ready
+    if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }
 }
 function Write-LaunchEvent {
     param([Parameter(Mandatory)][string]$Status, [Parameter(Mandatory)]$Issue, [string]$Message = '')
     $suffix = if ([string]::IsNullOrWhiteSpace($Message)) { '' } else { ' | ' + (Protect-MonitorText $Message) }
-    Write-Host ('{0:u} | {1,-12} | {2,-35} | #{3,-6}{4}' -f [DateTimeOffset]::UtcNow, $Status, $Issue.Repository, $Issue.Number, $suffix)
+    $line = '{0:u} | {1,-12} | {2,-35} | #{3,-6}{4}' -f [DateTimeOffset]::UtcNow, $Status, $Issue.Repository, $Issue.Number, $suffix
+    if ($script:IsActivityMonitor) { Add-ActivityMonitorNotice $line } else { Write-Host $line }
 }
 
 function Get-LaunchJsonlStatus {
     param([Parameter(Mandatory)]$Launch)
-    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; HasOutcomeMarker = $false; ProcessExited = $false } }
-    $marker = $null; $detail = ''; $requestedHuman = $false; $runnerExitCode = $null
+    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false } }
+    $marker = $null; $detail = ''; $latestActivity = ''; $requestedHuman = $false; $runnerExitCode = $null
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         $text = [string]$line
-        $agentText = ''
+        $agentText = ''; $hasUsableActivity = $true
         try {
             $json = $text | ConvertFrom-Json -ErrorAction Stop; $parts = @()
-            foreach ($name in @('type', 'event', 'status', 'message', 'error', 'output')) { if ($null -ne $json.PSObject.Properties[$name]) { $parts += [string]$json.$name } }
+            $hasUsableActivity = $false
+            foreach ($name in @('type', 'event', 'status', 'message', 'error', 'output')) {
+                if ($null -ne $json.PSObject.Properties[$name]) {
+                    $parts += [string]$json.$name
+                    if ($name -in @('message', 'error', 'output') -and -not [string]::IsNullOrWhiteSpace([string]$json.$name)) { $hasUsableActivity = $true }
+                }
+            }
             if ($parts.Count -gt 0) { $text = $parts -join ' ' }
             $item = if ($null -ne $json.PSObject.Properties['item']) { $json.item } else { $null }
             if ($null -ne $item -and $null -ne $item.PSObject.Properties['type'] -and [string]$item.type -eq 'agent_message') {
@@ -78,17 +102,68 @@ function Get-LaunchJsonlStatus {
         } catch { }
         $safeText = Protect-MonitorText $text
         $safeAgentText = Protect-MonitorText $agentText
+        $candidateActivity = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText }
+        if (-not [string]::IsNullOrWhiteSpace($safeAgentText)) { $hasUsableActivity = $true }
+        if ($hasUsableActivity -and -not [string]::IsNullOrWhiteSpace($candidateActivity)) { $latestActivity = Get-DisplayText $candidateActivity 120 }
         $matches = [regex]::Matches($safeAgentText, '(?i)WATCHER_OUTCOME\s*:\s*(done|needs-human|failed)\b')
         if ($matches.Count -gt 0) { $marker = $matches[$matches.Count - 1].Groups[1].Value.ToLowerInvariant(); $detail = $safeAgentText }
         if ($safeText -match '(?i)needs[-_ ]?human|human[-_ ]?input|approval required' -or $safeAgentText -match '(?i)need[s]? (?:a )?(?:clarification|decision|input)|please (?:clarify|provide)|question for') {
             $requestedHuman = $true; if ([string]::IsNullOrWhiteSpace($detail)) { $detail = if ([string]::IsNullOrWhiteSpace($safeAgentText)) { $safeText } else { $safeAgentText } }
         }
     }
-    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true } }
-    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode) } }
-    if ($requestedHuman) { return [pscustomobject]@{ Status = 'needs-human'; Detail = (Get-DisplayText $detail 120); HasOutcomeMarker = $false; ProcessExited = ($null -ne $runnerExitCode) } }
-    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; HasOutcomeMarker = $false; ProcessExited = $true } }
-    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; HasOutcomeMarker = $false; ProcessExited = $false }
+    $lastActivityAt = (Get-Item -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString('u')
+    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Codex runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true } }
+    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode) } }
+    if ($requestedHuman) { return [pscustomobject]@{ Status = 'needs-human'; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = ($null -ne $runnerExitCode) } }
+    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Codex exited without a valid WATCHER_OUTCOME marker.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true } }
+    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false }
+}
+
+function Get-ActivityMonitorRows {
+    param([Parameter(Mandatory)]$State)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($launch in @($State.launches)) {
+        if ($null -eq $launch) { continue }
+        $jsonl = Get-LaunchJsonlStatus $launch
+        $activity = if (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Detail)) { $jsonl.Detail } elseif (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Activity)) { $jsonl.Activity } elseif ([string]$launch.status -eq 'interrupted') { 'PID is no longer identity-verified; manual recovery is required.' } else { '-' }
+        [void]$rows.Add([pscustomobject]@{
+            Repository = [string]$launch.repository
+            Issue = [int]$launch.issueNumber
+            Status = [string]$launch.status
+            Pid = [string]$launch.pid
+            ActivityAt = [string]$jsonl.LastActivityAt
+            Activity = Get-DisplayText $activity 120
+        })
+    }
+    return @($rows)
+}
+
+function Write-ActivityMonitorSnapshot {
+    param($Config, [Parameter(Mandatory)]$Iteration)
+    Clear-Host
+    Write-Host 'local-issue-agent-monitor v1 | live agent activity'
+    Write-Host ('Refreshed UTC: {0:u} | next poll: {1:u}' -f [DateTimeOffset]::UtcNow, [DateTimeOffset]::UtcNow.AddSeconds($Iteration.PollIntervalSeconds))
+    if ($null -eq $Config) {
+        Write-Host 'Configuration is unavailable; no launch state can be shown.'
+    }
+    else {
+        $state = Read-IssueLaunchState -Path $Config.Launch.StatePath
+        $rows = @(Get-ActivityMonitorRows $state)
+        if (-not [bool]$Config.Launch.Enabled) { Write-Host 'New launch processing is disabled; showing preserved tracked launch state.' }
+        if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.' }
+        else {
+            Write-Host ('{0,-35} {1,-8} {2,-14} {3,-8} {4,-20} {5}' -f 'Repository', 'Issue', 'Status', 'PID', 'Latest activity UTC', 'Activity')
+            foreach ($row in $rows) {
+                $activityAt = if ([string]::IsNullOrWhiteSpace($row.ActivityAt)) { '-' } else { $row.ActivityAt }
+                Write-Host ('{0,-35} #{1,-7} {2,-14} {3,-8} {4,-20} {5}' -f (Get-DisplayText $row.Repository 35), $row.Issue, (Get-DisplayText $row.Status 14), $row.Pid, $activityAt, (Get-DisplayText $row.Activity 120))
+            }
+        }
+    }
+    if ($script:ActivityMonitorNotices.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Latest poll notices:'
+        foreach ($notice in @($script:ActivityMonitorNotices | Select-Object -Last 3)) { Write-Host (Get-DisplayText $notice 180) }
+    }
 }
 
 function Set-LaunchProperty {
@@ -222,20 +297,24 @@ function Invoke-LaunchMonitoring {
 }
 function Invoke-MonitorIteration {
     param([scriptblock]$CredentialReadScript)
-    try { $config = Get-IssueMonitorConfig -Path $ConfigPath } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false } }
+    try { $config = Get-IssueMonitorConfig -Path $ConfigPath } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = 60; Succeeded = $false; Config = $null } }
     if ($PSCmdlet.ParameterSetName -eq 'Stop') {
-        try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
+        try { Invoke-StopTrackedIssue $config; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config } } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
     }
     try {
         $gitHubToken = Get-GitHubIssuesToken -CredentialReadScript $CredentialReadScript
         $noStateWrite = [bool]$WhatIf -or -not [bool]$config.Launch.Enabled
         $result = Invoke-IssueMonitorPoll -Config $config -GitHubToken $gitHubToken -DoNotSaveState:$noStateWrite; foreach ($event in @($result.Events)) { Write-IssueMonitorEvent $event }; Invoke-LaunchMonitoring $config $result $gitHubToken
-        if ($result.SuccessfulRepositoryCount -eq 0) { Write-MonitorMessage 'No repository could be checked. Review the error rows above; local state was not changed.'; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
-        return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true }
-    } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false } }
+        if ($result.SuccessfulRepositoryCount -eq 0) { Write-MonitorMessage 'No repository could be checked. Review the error rows above; local state was not changed.'; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
+        return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $true; Config = $config }
+    } catch { Write-MonitorMessage $_.Exception.Message; return [pscustomobject]@{ PollIntervalSeconds = $config.PollIntervalSeconds; Succeeded = $false; Config = $config } }
 }
 
 if ($MyInvocation.InvocationName -eq '.') { return }
 if (-not $Watch) { [void](Invoke-MonitorIteration); return }
-Write-Host 'local-issue-agent-monitor v1 is watching. Press Ctrl+C to stop.'
-while ($true) { $iteration = Invoke-MonitorIteration; Write-Host ('Next attempt UTC: {0:u}' -f [DateTimeOffset]::UtcNow.AddSeconds($iteration.PollIntervalSeconds)); Start-Sleep -Seconds $iteration.PollIntervalSeconds }
+while ($true) {
+    $script:ActivityMonitorNotices.Clear()
+    $iteration = Invoke-MonitorIteration
+    Write-ActivityMonitorSnapshot -Config $iteration.Config -Iteration $iteration
+    Start-Sleep -Seconds $iteration.PollIntervalSeconds
+}
