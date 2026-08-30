@@ -76,6 +76,12 @@ JSONL, then choose one of these human actions:
 - preserve the existing artifacts and create a fresh Issue/request for a new
   isolated run.
 
+Once a PR is merged and its Issue is closed, an integration coordinator may
+clean up the associated local worktree and branch. It must first verify the
+merged PR, closed Issue, exited process, and clean worktree. The agent and
+watcher never perform this destructive cleanup themselves; failed,
+needs-human, and unmerged work stays available for recovery.
+
 `-WhatIf` is the recovery-safe inspection mode: it can calculate a plan but
 does not write state, create a Git worktree, change GitHub labels, or start or
 stop processes.
