@@ -19,7 +19,8 @@
     },
     "codexCommand": "codex",
     "runner": {
-      "type": "codex"
+      "type": "codex",
+      "approvalMode": "default"
     }
   }
 }

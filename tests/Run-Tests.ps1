@@ -357,6 +357,10 @@ try {
     $codexRunner = New-CodexIssueAgentRunner -Command 'fake-codex'
     Assert-Equal $codexRunner.Name 'codex' 'The built-in Codex adapter identifies its runner type'
     Assert-Equal $codexRunner.EventVersion 1 'The built-in Codex adapter declares normalized event version one'
+    Assert-Equal $codexRunner.ApprovalMode 'default' 'The built-in Codex adapter defaults to safe approval behavior'
+    Assert-True ($codexRunner.CommandDescription -notmatch [regex]::Escape('--approve-for-me')) 'The default Codex command does not opt into automatic approval'
+    $automaticApprovalRunner = New-CodexIssueAgentRunner -Command 'fake-codex' -ApprovalMode 'approve-for-me'
+    Assert-True ($automaticApprovalRunner.CommandDescription -match [regex]::Escape('--approve-for-me')) 'An explicit Codex approval setting adds only the configured automatic-approval argument'
     Assert-True ($codexRunner.CommandDescription -match '^fake-codex exec ' -and $codexRunner.CommandDescription -notmatch [regex]::Escape($plan.Prompt)) 'The Codex adapter constructs only runner arguments before prompt delivery'
     $fakeRunner = [pscustomobject]@{
         Name = 'fake'; EventVersion = 1; CommandDescription = 'fake agent runner'
@@ -381,7 +385,7 @@ try {
     Assert-True ($coreSource -match '\[Console\]::OutputEncoding' -and $coreSource -match '\$OutputEncoding') 'The generated runner reads Codex output as UTF-8 before writing JSONL'
     Assert-True ($coreSource -match 'Remove-Item -LiteralPath Env:GITHUB_ISSUES_TOKEN') 'The generated runner explicitly removes the GitHub token before launching an agent'
     Assert-True ($coreSource -match 'exec --sandbox workspace-write --json') 'The built-in Codex runner uses the workspace-write sandbox'
-    Assert-True ($coreSource -match 'prompt \| &.*command exec --sandbox workspace-write --json -- -' -and $coreSource -notmatch 'exec --sandbox workspace-write --json -- .*prompt') 'The Codex runner delivers Issue text through standard input, not a command-line argument'
+    Assert-True ($coreSource -match 'prompt \| &.*command exec --sandbox workspace-write --json @approvalArguments -- -' -and $coreSource -notmatch 'exec --sandbox workspace-write --json -- .*prompt') 'The Codex runner delivers Issue text through standard input, not a command-line argument'
 
     # A disposable non-Codex PowerShell executable exercises the generic runner
     # without network access or a vendor CLI. It records its CWD, prompt, and
@@ -441,11 +445,20 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $legacyRunnerLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{ enabled = $false; statePath = $launchStatePath; codexCommand = 'legacy-codex' }) -Repositories @('example-org/example-repo')
     Assert-Equal $legacyRunnerLaunch.Runner.Type 'codex' 'Existing configuration without launch.runner keeps the Codex runner'
     Assert-Equal $legacyRunnerLaunch.Runner.Command 'legacy-codex' 'Existing codexCommand remains the built-in runner command'
+    Assert-Equal $legacyRunnerLaunch.Runner.ApprovalMode 'default' 'Existing configurations omit automatic Codex approval by default'
+    $configuredCodexApprovalLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+        enabled = $false; statePath = $launchStatePath
+        runner = [pscustomobject]@{ type = 'codex'; command = 'configured-codex'; approvalMode = 'approve-for-me' }
+    }) -Repositories @('example-org/example-repo')
+    $configuredCodexApprovalRunner = New-IssueAgentRunnerFromConfiguration -Launch $configuredCodexApprovalLaunch
+    Assert-Equal $configuredCodexApprovalRunner.ApprovalMode 'approve-for-me' 'Configured Codex automatic approval is retained by the runner adapter'
+    Assert-True ($configuredCodexApprovalRunner.CommandDescription -match [regex]::Escape('--approve-for-me')) 'Configured Codex automatic approval changes the generated command only when requested'
     $configuredExternalLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
         enabled = $false; statePath = $launchStatePath
         runner = [pscustomobject]@{ type = 'external'; command = 'fake-external'; arguments = @('run'); promptTransport = 'file'; promptFileArgument = '--prompt-file' }
     }) -Repositories @('example-org/example-repo')
     Assert-Equal (New-IssueAgentRunnerFromConfiguration -Launch $configuredExternalLaunch).Name 'external' 'Configuration selects the generic external runner'
+    Assert-Equal (New-IssueAgentRunnerFromConfiguration -Launch $configuredExternalLaunch).Arguments[0] 'run' 'Configured external fixed arguments are retained by the runner adapter'
     $invalidRunnerMessage = ''
     $invalidRunnerWorktrees = Join-Path $temporaryRoot 'invalid-runner-worktrees'
     try {
@@ -458,6 +471,26 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     catch { $invalidRunnerMessage = $_.Exception.Message }
     Assert-True ($invalidRunnerMessage -match 'promptTransport') 'Unsupported external prompt transport has an actionable configuration error'
     Assert-True (-not (Test-Path -LiteralPath $invalidRunnerWorktrees)) 'Invalid external configuration creates no worktree before launch'
+    $invalidApprovalMessage = ''
+    try {
+        ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+            enabled = $true; worktreeDirectory = $invalidRunnerWorktrees; statePath = $launchStatePath
+            repositoryPaths = @{ 'example-org/example-repo' = $repositoryPath }
+            runner = [pscustomobject]@{ type = 'codex'; approvalMode = 'unsafe-value' }
+        }) -Repositories @('example-org/example-repo') | Out-Null
+    }
+    catch { $invalidApprovalMessage = $_.Exception.Message }
+    Assert-True ($invalidApprovalMessage -match 'approvalMode') 'Unsupported Codex approval mode has an actionable configuration error'
+    Assert-True (-not (Test-Path -LiteralPath $invalidRunnerWorktrees)) 'Invalid Codex approval configuration creates no worktree before launch'
+    $externalApprovalMessage = ''
+    try {
+        ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+            enabled = $false; statePath = $launchStatePath
+            runner = [pscustomobject]@{ type = 'external'; command = 'fake-agent'; arguments = @('run'); promptTransport = 'stdin'; approvalMode = 'default' }
+        }) -Repositories @('example-org/example-repo') | Out-Null
+    }
+    catch { $externalApprovalMessage = $_.Exception.Message }
+    Assert-True ($externalApprovalMessage -match 'approvalMode') 'Codex-only approval configuration is rejected for external runners'
     $metadata = New-IssueLaunchMetadata -Plan $plan -ProcessId $fakeProcess.Id -LogPath $fakeProcess.LogPath -ProcessStartedAt $fakeProcess.StartedAt
     Assert-Equal $metadata.status 'running' 'New process metadata starts as running'
     Assert-Equal $metadata.pid 867 'New process metadata stores the concrete PID'

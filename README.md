@@ -97,6 +97,23 @@ adapter or an `external` compatible CLI. If `launch.runner` is omitted, the
 monitor preserves the original behavior: it uses `launch.codexCommand` (or
 `codex`) with the built-in adapter.
 
+For Codex, `approvalMode` is `default` when omitted. This safe default invokes
+`codex exec --sandbox workspace-write --json` without an automatic-approval
+flag. Set it to `approve-for-me` only when the local user deliberately wants
+that Codex option:
+
+```json
+"runner": {
+  "type": "codex",
+  "command": "codex",
+  "approvalMode": "approve-for-me"
+}
+```
+
+`type: "codex"` accepts only `command` and `approvalMode`; `approvalMode` must
+be either `default` or `approve-for-me`. The monitor validates this before it
+calculates a launch plan or creates a worktree.
+
 An external runner starts with its current directory set to the assigned
 worktree. It receives no monitor GitHub token: the wrapper explicitly removes
 `GITHUB_ISSUES_TOKEN`. It is responsible for any vendor-specific sign-in and
@@ -111,10 +128,15 @@ standard input:
 "runner": {
   "type": "external",
   "command": "example-agent",
-  "arguments": ["run"],
+  "arguments": ["run", "--provider-setting", "value"],
   "promptTransport": "stdin"
 }
 ```
+
+External `arguments` must be an array of strings without NUL or line-break
+characters. They are fixed configuration values passed as distinct process
+arguments, so provider-specific settings can be changed without modifying the
+monitor. `approvalMode` is not supported for external runners.
 
 For a CLI that expects a file, the monitor writes a distinct UTF-8 (no BOM)
 prompt file in the external state directory and supplies it as a separate
