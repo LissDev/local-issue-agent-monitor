@@ -4,6 +4,8 @@ param(
     [Parameter(ParameterSetName = 'Once')][switch]$Once,
     [Parameter(Mandatory, ParameterSetName = 'Watch')][switch]$Watch,
     [Parameter(ParameterSetName = 'Follow')][switch]$Follow,
+    # Read-only view of completed and superseded launch records.
+    [Parameter(Mandatory, ParameterSetName = 'History')][switch]$History,
     [Parameter(Mandatory, ParameterSetName = 'Stop')][ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$')][string]$StopIssue,
     # Plan only: does not alter GitHub, Git, launch state, or child processes.
     [Parameter(ParameterSetName = 'Once')][Parameter(ParameterSetName = 'Watch')][Parameter(ParameterSetName = 'Stop')][switch]$WhatIf
@@ -166,12 +168,30 @@ function Get-LaunchJsonlStatus {
     return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' }
 }
 
+function Test-LaunchIsSuperseded {
+    param([Parameter(Mandatory)]$Launch)
+    return $null -ne $Launch.PSObject.Properties['supersededAt'] -and -not [string]::IsNullOrWhiteSpace([string]$Launch.supersededAt)
+}
+
+function Test-LaunchIsHistorical {
+    param([Parameter(Mandatory)]$Launch)
+    return (Test-LaunchIsSuperseded $Launch) -or [string]$Launch.status -eq 'done'
+}
+
+function Get-ActiveLaunches {
+    param([Parameter(Mandatory)]$State)
+    return @($State.launches | Where-Object { $null -ne $_ -and -not (Test-LaunchIsHistorical $_) })
+}
+
+function Get-HistoricalLaunches {
+    param([Parameter(Mandatory)]$State)
+    return @($State.launches | Where-Object { $null -ne $_ -and (Test-LaunchIsHistorical $_) })
+}
+
 function Get-ActivityMonitorRows {
     param([Parameter(Mandatory)]$State)
     $rows = [System.Collections.Generic.List[object]]::new()
-    foreach ($launch in @($State.launches)) {
-        if ($null -eq $launch) { continue }
-        if ([string]$launch.status -eq 'done') { continue }
+    foreach ($launch in @(Get-ActiveLaunches $State)) {
         $jsonl = Get-LaunchJsonlStatus $launch
         $activity = if (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Detail)) { $jsonl.Detail } elseif (-not [string]::IsNullOrWhiteSpace([string]$jsonl.Activity)) { $jsonl.Activity } elseif ([string]$launch.status -eq 'interrupted') { 'PID is no longer identity-verified; manual recovery is required.' } else { '-' }
         [void]$rows.Add([pscustomobject]@{
@@ -184,6 +204,35 @@ function Get-ActivityMonitorRows {
         })
     }
     return @($rows)
+}
+
+function Get-LaunchHistoryRows {
+    param([Parameter(Mandatory)]$State)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($launch in @(Get-HistoricalLaunches $State)) {
+        $superseded = Test-LaunchIsSuperseded $launch
+        [void]$rows.Add([pscustomobject]@{
+            Repository = [string]$launch.repository
+            Issue = [int]$launch.issueNumber
+            Attempt = if ($null -ne $launch.PSObject.Properties['attempt']) { [string]$launch.attempt } else { '-' }
+            Status = [string]$launch.status
+            HistoricalState = if ($superseded) { 'superseded' } else { 'completed' }
+            StartedAt = if ($null -ne $launch.PSObject.Properties['startedAt']) { Format-MonitorLocalTimeText ([string]$launch.startedAt) } else { '-' }
+            SupersededAt = if ($superseded) { Format-MonitorLocalTimeText ([string]$launch.supersededAt) } else { '-' }
+        })
+    }
+    return @($rows)
+}
+
+function Write-LaunchHistory {
+    param([Parameter(Mandatory)]$Config)
+    Write-Host 'local-issue-agent-monitor v1 | launch history (read-only)'
+    $rows = @(Get-LaunchHistoryRows (Read-IssueLaunchState -Path $Config.Launch.StatePath))
+    if ($rows.Count -eq 0) { Write-Host 'No historical agent launches.'; return }
+    Write-Host ('{0,-35} {1,-8} {2,-8} {3,-14} {4,-16} {5,-26} {6}' -f 'Repository', 'Issue', 'Attempt', 'Status', 'Historical state', 'Started (local)', 'Superseded (local)')
+    foreach ($row in $rows) {
+        Write-Host ('{0,-35} #{1,-7} {2,-8} {3,-14} {4,-16} {5,-26} {6}' -f (Get-DisplayText $row.Repository 35), $row.Issue, $row.Attempt, (Get-DisplayText $row.Status 14), $row.HistoricalState, $row.StartedAt, $row.SupersededAt)
+    }
 }
 
 function Write-ActivityMonitorSnapshot {
@@ -331,8 +380,8 @@ function Convert-JsonlLineToFollowText {
 function Get-FollowLogEvents {
     param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][hashtable]$Cursors, [switch]$Initialize)
     $events = [System.Collections.Generic.List[object]]::new()
-    foreach ($launch in @($State.launches)) {
-        if ($null -eq $launch -or [string]::IsNullOrWhiteSpace([string]$launch.logPath) -or -not (Test-Path -LiteralPath $launch.logPath -PathType Leaf)) { continue }
+    foreach ($launch in @(Get-ActiveLaunches $State)) {
+        if ([string]::IsNullOrWhiteSpace([string]$launch.logPath) -or -not (Test-Path -LiteralPath $launch.logPath -PathType Leaf)) { continue }
         $lines = @(Get-Content -LiteralPath $launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)
         $key = [string]$launch.logPath; $offset = if ($Cursors.ContainsKey($key)) { [int]$Cursors[$key] } else { 0 }
         if ($Initialize -and -not $Cursors.ContainsKey($key)) { $Cursors[$key] = $lines.Count; continue }
@@ -352,8 +401,8 @@ function Write-FollowSnapshot {
     $heartbeat = $HeartbeatStatus.Heartbeat
     Write-Host 'local-issue-agent-monitor v1 | follow (read-only)'
     Write-Host ('Watcher PID: {0} | Last heartbeat (local): {1} | Config: {2}' -f $heartbeat.pid, (Format-MonitorLocalTimeText $heartbeat.heartbeatAt), $heartbeat.config.launchStatePath)
-    $rows = @((Read-IssueLaunchState -Path $Config.Launch.StatePath).launches | Where-Object { $null -ne $_ })
-    if ($rows.Count -eq 0) { Write-Host 'No tracked agent launches.'; return }
+    $rows = @(Get-ActiveLaunches (Read-IssueLaunchState -Path $Config.Launch.StatePath))
+    if ($rows.Count -eq 0) { Write-Host 'No active agent launches.'; return }
     Write-Host ('{0,-35} {1,-8} {2,-14} {3}' -f 'Repository', 'Issue', 'Status', 'PID')
     foreach ($row in $rows) {
         Write-Host ('{0,-35} #{1,-7} {2,-14} {3}' -f (Get-DisplayText ([string]$row.repository) 35), $row.issueNumber, (Get-DisplayText ([string]$row.status) 14), $row.pid)
@@ -595,6 +644,7 @@ try { $resolvedConfig = Get-IssueMonitorConfig -Path $ConfigPath }
 catch { Write-MonitorMessage $_.Exception.Message; return }
 switch ($PSCmdlet.ParameterSetName) {
     'Follow' { Invoke-FollowMode -Config $resolvedConfig; return }
+    'History' { Write-LaunchHistory -Config $resolvedConfig; return }
     'Watch' { Invoke-WatchMode -Config $resolvedConfig; return }
     'Once' {
         $heartbeatStatus = Get-WatcherHeartbeatStatus -HeartbeatPath (Get-WatcherHeartbeatPath $resolvedConfig) -MaximumAgeSeconds (Get-WatcherHeartbeatMaximumAgeSeconds $resolvedConfig)

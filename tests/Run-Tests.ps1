@@ -792,15 +792,24 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $monitorRows = @(Get-ActivityMonitorRows ([pscustomobject]@{ launches = @(
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 98; status = 'done'; pid = 1234; logPath = '' },
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; status = 'needs-human'; pid = 4321; logPath = $jsonlFixture },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; attempt = 1; status = 'needs-human'; pid = 4320; logPath = $jsonlFixture; startedAt = '2026-08-30T08:00:00Z'; supersededAt = '2026-08-30T09:30:00Z' },
         [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 100; status = 'interrupted'; pid = 5432; logPath = '' }
     ) }))
-    Assert-Equal $monitorRows.Count 2 'The activity monitor hides completed launches'
+    Assert-Equal $monitorRows.Count 2 'The activity monitor hides completed and superseded launches'
     Assert-Equal $monitorRows[0].Repository 'example-org/example-repo' 'Activity rows include the repository'
     Assert-Equal $monitorRows[0].Issue 99 'Activity rows include the Issue number'
     Assert-Equal $monitorRows[0].Pid '4321' 'Activity rows include the tracked PID'
     Assert-Equal $monitorRows[0].ActivityAt $expectedActivityDisplay 'Activity rows render JSONL file times in local time'
     Assert-Equal $monitorRows[1].Status 'interrupted' 'Activity rows preserve interrupted terminal status'
     Assert-True ($monitorRows[1].Activity -match 'manual recovery') 'Interrupted rows explain the recovery state'
+    $historyRows = @(Get-LaunchHistoryRows ([pscustomobject]@{ launches = @(
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 98; attempt = 1; status = 'done'; pid = 1234; logPath = ''; startedAt = '2026-08-30T07:00:00Z' },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; attempt = 1; status = 'needs-human'; pid = 4320; logPath = $jsonlFixture; startedAt = '2026-08-30T08:00:00Z'; supersededAt = '2026-08-30T09:30:00Z' },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; attempt = 2; status = 'running'; pid = 4321; logPath = $jsonlFixture }
+    ) }))
+    Assert-Equal $historyRows.Count 2 'History retains completed and superseded launches separately from active rows'
+    Assert-Equal $historyRows[1].HistoricalState 'superseded' 'A superseded needs-human attempt is clearly marked as historical'
+    Assert-True ($historyRows[1].SupersededAt -match '[+-][0-9]{2}:[0-9]{2}$') 'History displays the superseded timestamp in local time'
     $script:IsActivityMonitor = $true; $script:ActivityMonitorCompletedIssueKeys.Clear()
     Add-ActivityMonitorCompletedIssue ([pscustomobject]@{ Repository = 'example-org/example-repo'; Number = 98 })
     Add-ActivityMonitorCompletedIssue ([pscustomobject]@{ Repository = 'example-org/example-repo'; Number = 99 })
@@ -818,6 +827,19 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True ($snapshot -match 'Completed this session:' -and $snapshot -match 'example-org/example-repo: 2') 'Watch snapshot shows per-project completion counts for the current session'
     Assert-True ($snapshot -match 'example-org/example-repo' -and $snapshot -match '#99' -and $snapshot -match '4321' -and $snapshot -match 'interrupted') 'Watch snapshot shows repository, Issue, PID, and terminal status'
     Assert-True ($snapshot -notmatch 'github_pat_secret_value') 'Watch snapshot does not reveal activity secrets'
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @(
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; attempt = 1; status = 'needs-human'; pid = 4320; startedAt = '2026-08-30T08:00:00Z'; supersededAt = '2026-08-30T09:30:00Z' },
+        [pscustomobject]@{ repository = 'example-org/example-repo'; issueNumber = 99; attempt = 2; status = 'running'; pid = 4321 }
+    ) }) -Path $snapshotStatePath
+    $historyOutput = (& { Write-LaunchHistory -Config $snapshotConfig } 6>&1 | Out-String)
+    Assert-True ($historyOutput -match 'launch history \(read-only\)' -and $historyOutput -match 'superseded' -and $historyOutput -match '#99') 'The explicit history view shows superseded attempts separately'
+    Assert-True ($historyOutput -notmatch 'running') 'The explicit history view does not mix in the current active attempt'
+    $historyConfigPath = Join-Path $temporaryRoot 'history.json'
+    $historyFileConfig = $followFileConfig | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $historyFileConfig.launch.statePath = $snapshotStatePath
+    [IO.File]::WriteAllText($historyConfigPath, ($historyFileConfig | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+    $historyCliOutput = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'Invoke-IssueMonitor.ps1') -ConfigPath $historyConfigPath -History 2>&1 | Out-String)
+    Assert-True ($historyCliOutput -match 'launch history \(read-only\)' -and $historyCliOutput -match 'superseded' -and $historyCliOutput -notmatch 'running') 'The -History command is read-only and excludes active attempts'
     $script:IsActivityMonitor = $false; $script:ActivityMonitorCompletedIssueKeys.Clear()
     [IO.File]::WriteAllText($jsonlFixture, '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"commit-request","message":"Implementation complete."}' + "`n" + '{"version":1,"type":"watcher-agent-event","event":"exit","exitCode":0}')
     Assert-Equal (Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $jsonlFixture })).Status 'commit-request' 'Only an explicit commit-request marker asks the watcher to create a commit'
