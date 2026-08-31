@@ -184,6 +184,28 @@ syntax or a child-process command line.
 
 ## Monitor modes
 
+### Polling-only and launch-enabled operation
+
+The `launch.enabled` setting selects what a poll can do:
+
+| Configuration | What a poll does | What it does not do |
+| --- | --- | --- |
+| `launch.enabled: false` | Reads configured GitHub Issues and reports matching watched labels. | Does not create a worktree, start an agent, write launch metadata, or change GitHub labels. An Issue with `agent:run` is reported as queued, but no launch is requested. |
+| `launch.enabled: true` | Performs the same poll and, for an eligible Issue, coordinates a local agent launch. | It still never pushes, opens a pull request, merges, or deletes a worktree. |
+
+`false` is the safe default in `config.example.json`. Set it to `true` only
+after configuring the absolute `launch.worktreeDirectory`, `launch.statePath`,
+and `launch.repositoryPaths` values for every monitored repository.
+
+With launching enabled, an Issue must have exactly one `type:*` label together
+with `status:ready` and `agent:run`. The monitor then plans an isolated branch
+and worktree, starts and tracks the configured local runner, records its JSONL
+and launch state, updates agent lifecycle labels, and handles its terminal
+result. A `commit-request` result is validated against the recorded worktree,
+branch, baseline commit, and diff before the watcher creates one local commit.
+
+### Commands
+
 Observation is the default and is read-only:
 
 ```powershell
@@ -256,6 +278,34 @@ To stop one concrete tracked launch without deleting anything:
 This stops only the stored PID and records `interrupted`; it preserves the
 branch, worktree, logs, and agent result for human recovery.  Add `-WhatIf` to
 print the target without stopping it.
+
+## Issue branch names
+
+For an initial eligible launch, the monitor names the Issue branch as:
+
+```text
+<type>/issue-<number>/<short-name>
+```
+
+`<type>` is the value from the single `type:*` Issue label, and `<number>` is
+the GitHub Issue number. The `<short-name>` comes from the Issue title: it is
+lowercased, and only ASCII Latin letters (`a` through `z`) and digits (`0`
+through `9`) are kept. Runs of other characters, including spaces,
+punctuation, accented characters, and non-Latin text, are removed or converted
+to a single `-` separator; leading and trailing separators are removed. The
+suffix is limited to 48 characters.
+
+For example:
+
+| Issue labels and title | Initial branch |
+| --- | --- |
+| `type:feat`; `Add monitor status view` (#42) | `feat/issue-42/add-monitor-status-view` |
+| `type:fix`; `Исправить ошибку` (#34) | `fix/issue-34/issue` |
+
+If the title has no usable ASCII letter or digit, its `<short-name>` falls back
+to `issue`; the Cyrillic-only example above therefore does not use
+transliteration. If a terminal launch is deliberately retried after `agent:run`
+is added again, the recorded branch is reused.
 
 ## Statuses and recovery
 
