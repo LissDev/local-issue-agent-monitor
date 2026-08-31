@@ -110,9 +110,10 @@ that Codex option:
 }
 ```
 
-`type: "codex"` accepts only `command` and `approvalMode`; `approvalMode` must
-be either `default` or `approve-for-me`. The monitor validates this before it
-calculates a launch plan or creates a worktree.
+`type: "codex"` accepts `command`, `approvalMode`, and the optional
+`delegationAvailable` capability declaration. `approvalMode` must be either
+`default` or `approve-for-me`. The monitor validates this before it calculates
+a launch plan or creates a worktree.
 
 An external runner starts with its current directory set to the assigned
 worktree. It receives no monitor GitHub token: the wrapper explicitly removes
@@ -137,6 +138,30 @@ External `arguments` must be an array of strings without NUL or line-break
 characters. They are fixed configuration values passed as distinct process
 arguments, so provider-specific settings can be changed without modifying the
 monitor. `approvalMode` is not supported for external runners.
+
+## Opt-in multi-agent execution
+
+Add `execution:multi-agent` to an otherwise eligible Issue to request a
+multi-agent run. The label is configurable through
+`launch.executionModeLabel`; it must be a namespaced label outside the
+reserved `agent:` lifecycle prefix. Issues without this label keep the normal
+single-agent prompt and behavior.
+
+For a selected runner, set `launch.runner.delegationAvailable` to `true` only
+when that environment can delegate work. This is a provider-neutral capability
+declaration: the watcher does not inspect skills, files, or vendor APIs. If an
+Issue requests multi-agent execution but the configured runner does not declare
+this capability, the watcher records `needs-human` before creating a worktree
+or process and does not fall back to a single-agent implementation.
+
+The multi-agent prompt requires the lead agent to choose the environment's
+delegation mechanism, divide responsibilities before edits, prevent overlapping
+parallel edits, and retain integration and verification. The agent reports
+`WATCHER_DELEGATES_CREATED` and, when applicable,
+`WATCHER_DELEGATION_REFUSAL`; the watcher records these fields as structured
+launch telemetry. A requested multi-agent run cannot complete successfully
+without a positive delegate count. Lifecycle transitions replace only
+`agent:*` labels, so `execution:multi-agent` is retained.
 
 For a CLI that expects a file, the monitor writes a distinct UTF-8 (no BOM)
 prompt file in the external state directory and supplies it as a separate

@@ -137,8 +137,8 @@ function Write-LaunchEvent {
 
 function Get-LaunchJsonlStatus {
     param([Parameter(Mandatory)]$Launch)
-    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' } }
-    $marker = $null; $detail = ''; $latestActivity = ''; $humanRequest = ''; $runnerExitCode = $null
+    if ([string]::IsNullOrWhiteSpace([string]$Launch.logPath) -or -not (Test-Path -LiteralPath $Launch.logPath -PathType Leaf)) { return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = ''; LastActivityAt = ''; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = ''; DelegatesCreated = $null; DelegationRefusalReason = '' } }
+    $marker = $null; $detail = ''; $latestActivity = ''; $humanRequest = ''; $runnerExitCode = $null; $delegatesCreated = $null; $delegationRefusalReason = ''
     foreach ($line in @(Get-Content -LiteralPath $Launch.logPath -Encoding utf8 -ErrorAction SilentlyContinue)) {
         if ([string]::IsNullOrWhiteSpace([string]$line)) { continue }
         try {
@@ -156,16 +156,20 @@ function Get-LaunchJsonlStatus {
                     }
                 }
             }
+            if ($event -eq 'delegation') {
+                if ($null -ne $json.PSObject.Properties['delegatesCreated']) { $candidateCount = 0; if ([int]::TryParse([string]$json.delegatesCreated, [ref]$candidateCount) -and $candidateCount -ge 0) { $delegatesCreated = $candidateCount } }
+                if ($null -ne $json.PSObject.Properties['delegationRefusalReason']) { $delegationRefusalReason = Get-DisplayText (Protect-MonitorText ([string]$json.delegationRefusalReason)) 600 }
+            }
             if ($event -eq 'exit' -and $null -ne $json.PSObject.Properties['exitCode']) { $parsedExitCode = 0; if ([int]::TryParse([string]$json.exitCode, [ref]$parsedExitCode)) { $runnerExitCode = $parsedExitCode } }
         } catch {
             continue
         }
     }
     $lastActivityAt = (Get-Item -LiteralPath $Launch.logPath -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString('u')
-    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Agent runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true; HumanRequest = '' } }
-    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode); HumanRequest = if ($marker -eq 'needs-human') { $humanRequest } else { '' } } }
-    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Agent runner exited without a valid terminal outcome.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true; HumanRequest = '' } }
-    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = '' }
+    if ($null -ne $runnerExitCode -and $runnerExitCode -ne 0) { return [pscustomobject]@{ Status = 'failed'; Detail = (Get-DisplayText 'Agent runner exited with a nonzero status.' 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = ($null -ne $marker); ProcessExited = $true; HumanRequest = ''; DelegatesCreated = $delegatesCreated; DelegationRefusalReason = $delegationRefusalReason } }
+    if ($null -ne $marker) { return [pscustomobject]@{ Status = $marker; Detail = (Get-DisplayText $detail 120); Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $true; ProcessExited = ($null -ne $runnerExitCode); HumanRequest = if ($marker -eq 'needs-human') { $humanRequest } else { '' }; DelegatesCreated = $delegatesCreated; DelegationRefusalReason = $delegationRefusalReason } }
+    if ($null -ne $runnerExitCode) { return [pscustomobject]@{ Status = 'needs-human'; Detail = 'Agent runner exited without a valid terminal outcome.'; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $true; HumanRequest = ''; DelegatesCreated = $delegatesCreated; DelegationRefusalReason = $delegationRefusalReason } }
+    return [pscustomobject]@{ Status = [string]$Launch.status; Detail = ''; Activity = $latestActivity; LastActivityAt = $lastActivityAt; HasOutcomeMarker = $false; ProcessExited = $false; HumanRequest = ''; DelegatesCreated = $delegatesCreated; DelegationRefusalReason = $delegationRefusalReason }
 }
 
 function Test-LaunchIsSuperseded {
@@ -519,6 +523,13 @@ function Invoke-LaunchMonitoring {
         $currentIssue = $issuesByKey[([string]$launch.issue)]
         if ($null -ne $currentIssue -and (Invoke-LaunchLabelTransition $currentIssue $launch $Config 'running' $GitHubToken)) { $stateChanged = $true }
         $jsonl = Get-LaunchJsonlStatus $launch
+        if ($null -ne $jsonl.DelegatesCreated) {
+            if ($null -eq $launch.PSObject.Properties['delegatesCreated'] -or [int]$launch.delegatesCreated -ne [int]$jsonl.DelegatesCreated) { Set-LaunchProperty $launch 'delegatesCreated' ([int]$jsonl.DelegatesCreated); $stateChanged = $true }
+        }
+        $existingDelegationRefusalReason = if ($null -ne $launch.PSObject.Properties['delegationRefusalReason']) { [string]$launch.delegationRefusalReason } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace([string]$jsonl.DelegationRefusalReason) -and $existingDelegationRefusalReason -ne [string]$jsonl.DelegationRefusalReason) {
+            Set-LaunchProperty $launch 'delegationRefusalReason' ([string]$jsonl.DelegationRefusalReason); $stateChanged = $true
+        }
         if ($jsonl.Status -ne 'running') {
             # A final response can reach JSONL shortly before its runner-exit
             # record. Never stage or commit while the agent process is still
@@ -526,6 +537,14 @@ function Invoke-LaunchMonitoring {
             if ($jsonl.Status -eq 'commit-request' -and -not $jsonl.ProcessExited) { continue }
             $terminalStatus = [string]$jsonl.Status
             $terminalDetail = [string]$jsonl.Detail
+            $delegationRequested = $null -ne $launch.PSObject.Properties['delegationRequested'] -and [bool]$launch.delegationRequested
+            $delegateCount = if ($null -ne $launch.PSObject.Properties['delegatesCreated']) { [int]$launch.delegatesCreated } else { 0 }
+            if ($delegationRequested -and $delegateCount -lt 1) {
+                $terminalStatus = 'needs-human'
+                $terminalDelegationRefusalReason = if ($null -ne $launch.PSObject.Properties['delegationRefusalReason']) { [string]$launch.delegationRefusalReason } else { '' }
+                $terminalDetail = if (-not [string]::IsNullOrWhiteSpace($terminalDelegationRefusalReason)) { $terminalDelegationRefusalReason } else { 'Multi-agent execution was requested, but no delegates were recorded.' }
+                if ([string]::IsNullOrWhiteSpace($terminalDelegationRefusalReason)) { Set-LaunchProperty $launch 'delegationRefusalReason' $terminalDetail }
+            }
             if ($terminalStatus -eq 'commit-request') {
                 $commitResult = Invoke-IssueLaunchCommitRequest -LaunchMetadata $launch
                 if ($commitResult.Committed) {
@@ -574,6 +593,15 @@ function Invoke-LaunchMonitoring {
             $plan = New-IssueLaunchPlan -Issue $issue -Launch $Config.Launch -PriorLaunches $known
             $runner = New-IssueAgentRunnerFromConfiguration -Launch $Config.Launch
             if ($WhatIf) { Write-LaunchEvent 'preflight' $issue ("WhatIf plan: branch={0}; worktree={1}; command={2}" -f $plan.Branch, $plan.WorktreePath, $runner.CommandDescription); continue }
+            if ($plan.DelegationRequested -and -not [bool]$runner.DelegationAvailable) {
+                $reason = 'Multi-agent execution was requested, but the configured runner does not declare delegation capability.'
+                $attempt = @($known).Count + 1
+                $metadata = New-IssueDelegationRefusalMetadata -Issue $issue -Attempt $attempt -Reason $reason
+                $state.launches = @($state.launches) + @($metadata); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
+                Write-LaunchEvent 'needs-human' $issue $reason
+                [void](Invoke-LaunchLabelTransition $issue $metadata $Config 'needs-human' $GitHubToken); Save-IssueLaunchState -State $state -Path $Config.Launch.StatePath
+                continue
+            }
             Find-IssueAgentRunnerCommand -Runner $runner | Out-Null
             New-IssueLaunchWorktree -Plan $plan -Launch $Config.Launch | Out-Null
             $stateDirectory = Split-Path -Path $Config.Launch.StatePath -Parent; $logPath = Join-Path $stateDirectory ('issue-{0}-{1}.jsonl' -f $issue.Number, [Guid]::NewGuid().ToString('N'))

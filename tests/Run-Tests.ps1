@@ -343,7 +343,16 @@ try {
     Assert-True ($plan.Prompt -match 'Do not remove the worktree, branch, JSONL log, or runner file') 'Prompt assigns post-merge cleanup to the integration coordinator'
     Assert-True ($plan.Prompt -notmatch [regex]::Escape($testToken)) 'The GitHub token is never included in the agent prompt'
     Assert-True ($plan.Prompt -match 'read AGENTS\.md') 'Prompt requires the agent to read repository rules before edits'
+    Assert-True ($plan.Prompt -notmatch 'WATCHER_DELEGATES_CREATED') 'A normal launch does not add multi-agent delegation requirements'
     Assert-Equal $plan.BaseCommit '1111111111111111111111111111111111111111' 'Launch plan records the verified baseline commit'
+    $multiAgentIssue = ConvertTo-MonitoredIssue -Repository 'example-org/example-repo' -Issue (New-RawIssue -Number 82 -Title 'Split safe work' -Labels @('type:feat', 'status:ready', 'agent:run', 'execution:multi-agent'))
+    $multiAgentPlan = New-IssueLaunchPlan -Issue $multiAgentIssue -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit
+    Assert-True $multiAgentPlan.DelegationRequested 'The configured execution label explicitly requests delegation'
+    Assert-True ($multiAgentPlan.Prompt -match 'division of responsibility' -and $multiAgentPlan.Prompt -match 'Do not make parallel, overlapping edits' -and $multiAgentPlan.Prompt -match 'WATCHER_DELEGATES_CREATED') 'A multi-agent launch receives neutral delegation and telemetry requirements'
+    Assert-True ($multiAgentPlan.Prompt -notmatch 'human-horizon-orchestration' -and $multiAgentPlan.Prompt -notmatch 'spawn_agent') 'The multi-agent prompt names no skills or platform-specific delegation APIs'
+    $delegationRefusal = New-IssueDelegationRefusalMetadata -Issue $multiAgentIssue -Attempt 1 -Reason 'The configured runner does not declare delegation capability.'
+    Assert-Equal $delegationRefusal.status 'needs-human' 'Missing delegation capability ends the launch as needs-human'
+    Assert-True ($delegationRefusal.delegationRequested -and $delegationRefusal.delegatesCreated -eq 0 -and $delegationRefusal.delegationRefusalReason -match 'does not declare') 'Capability refusal stores structured delegation telemetry'
     $worktree = New-IssueLaunchWorktree -Plan $plan -Launch $enabledLaunch -TestPathScript $fakePath -GitScript $fakeGit
     Assert-True $worktree.Created 'Fake Git receives a worktree creation request only after preflight'
     Assert-True (@($script:fakeGitCalls | Where-Object { $_ -match '^worktree add -b ' }).Count -eq 1) 'Exactly one fake worktree add is issued'
@@ -396,6 +405,8 @@ param([string]$Mode, [string]$Outcome, [string]$ResultPath, [string]$PromptFile)
 $prompt = if ($Mode -eq 'file') { [IO.File]::ReadAllText($PromptFile, [Text.UTF8Encoding]::new($false)) } else { [Console]::In.ReadToEnd() }
 [pscustomobject]@{ cwd = (Get-Location).Path; prompt = $prompt; githubToken = [string]$env:GITHUB_ISSUES_TOKEN } | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding utf8
 Write-Output 'fake external activity'
+if ($Outcome -eq 'done') { Write-Output 'WATCHER_DELEGATES_CREATED: 2' }
+if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_DELEGATES_CREATED: 0'; Write-Output 'WATCHER_DELEGATION_REFUSAL: The fake work cannot be divided safely.' }
 Write-Output ('WATCHER_OUTCOME: ' + $Outcome)
 if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose the fake external setting.' }
 '@
@@ -432,8 +443,13 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
             Assert-True (@($externalEvents | Where-Object { $_.event -eq 'activity' -and $_.message -eq 'fake external activity' }).Count -eq 1) 'External output is retained as normalized activity'
             $expectedNormalizedOutcome = if ($outcome -eq 'done') { 'commit-request' } else { $outcome }
             Assert-True (@($externalEvents | Where-Object { $_.event -eq 'outcome' -and $_.outcome -eq $expectedNormalizedOutcome }).Count -eq 1) 'External terminal text is normalized to the expected watcher outcome'
+            if ($outcome -in @('done', 'needs-human')) {
+                $expectedDelegatesCreated = if ($outcome -eq 'done') { 2 } else { 0 }
+                Assert-True (@($externalEvents | Where-Object { $_.event -eq 'delegation' } | Where-Object { $_.PSObject.Properties['delegatesCreated'] -ne $null -and $_.delegationRequested -and $_.delegatesCreated -eq $expectedDelegatesCreated }).Count -eq 1) 'External runner telemetry records the reported delegate count'
+            }
             if ($outcome -eq 'needs-human') {
                 Assert-True (@($externalEvents | Where-Object { $_.event -eq 'outcome' -and $null -ne $_.PSObject.Properties['humanRequest'] -and $_.humanRequest -eq 'Choose the fake external setting.' }).Count -eq 1) 'External needs-human retains its sanitized human request'
+                Assert-True (@($externalEvents | Where-Object { $_.event -eq 'delegation' } | Where-Object { $_.PSObject.Properties['delegationRefusalReason'] -ne $null -and $_.delegationRefusalReason -eq 'The fake work cannot be divided safely.' }).Count -eq 1) 'External runner telemetry records a delegation refusal reason'
             }
             Assert-True (@($externalEvents | Where-Object { $_.event -eq 'exit' -and $_.exitCode -eq 0 }).Count -eq 1) 'External exit is retained in the normalized event stream'
         }
@@ -453,6 +469,16 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     $configuredCodexApprovalRunner = New-IssueAgentRunnerFromConfiguration -Launch $configuredCodexApprovalLaunch
     Assert-Equal $configuredCodexApprovalRunner.ApprovalMode 'approve-for-me' 'Configured Codex automatic approval is retained by the runner adapter'
     Assert-True ($configuredCodexApprovalRunner.CommandDescription -match [regex]::Escape('--approve-for-me')) 'Configured Codex automatic approval changes the generated command only when requested'
+    $configuredMultiAgentLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
+        enabled = $false; statePath = $launchStatePath; executionModeLabel = 'execution:delegated'
+        runner = [pscustomobject]@{ type = 'codex'; command = 'configured-codex'; delegationAvailable = $true }
+    }) -Repositories @('example-org/example-repo')
+    Assert-Equal $configuredMultiAgentLaunch.ExecutionModeLabel 'execution:delegated' 'The execution-mode label is configurable'
+    Assert-True (New-IssueAgentRunnerFromConfiguration -Launch $configuredMultiAgentLaunch).DelegationAvailable 'The runner capability declaration is available without platform-specific APIs'
+    Assert-True (-not $legacyRunnerLaunch.Runner.DelegationAvailable) 'Existing runner configuration defaults to no delegation capability'
+    $invalidExecutionModeLabel = ''
+    try { ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{ enabled = $false; statePath = $launchStatePath; executionModeLabel = 'agent:multi-agent' }) -Repositories @('example-org/example-repo') | Out-Null } catch { $invalidExecutionModeLabel = $_.Exception.Message }
+    Assert-True ($invalidExecutionModeLabel -match 'executionModeLabel') 'Lifecycle-prefixed execution labels are rejected'
     $configuredExternalLaunch = ConvertTo-IssueMonitorLaunchConfiguration -Launch ([pscustomobject]@{
         enabled = $false; statePath = $launchStatePath
         runner = [pscustomobject]@{ type = 'external'; command = 'fake-external'; arguments = @('run'); promptTransport = 'file'; promptFileArgument = '--prompt-file' }
@@ -569,6 +595,11 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Request-IssueLaunchAgentLabel -Issue $retryIssue -Launch $enabledLaunch -Status 'running' -LabelRequestScript $fakeLabel | Out-Null
     Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 'Retry start clears the prior terminal label and agent:run together'
     Assert-True ($script:lastLabels -contains 'agent:running') 'Retry start sets agent:running'
+    foreach ($executionLifecycleStatus in @('running', 'needs-human', 'done')) {
+        Request-IssueLaunchAgentLabel -Issue $multiAgentIssue -Launch $enabledLaunch -Status $executionLifecycleStatus -LabelRequestScript $fakeLabel | Out-Null
+        Assert-True ($script:lastLabels -contains 'execution:multi-agent') "The execution-mode label survives agent:$executionLifecycleStatus"
+        Assert-Equal @($script:lastLabels | Where-Object { $_ -like 'agent:*' }).Count 1 "agent:$executionLifecycleStatus retains exactly one lifecycle label"
+    }
     $script:labelHttpCalls = 0
     $labelHttpRequest = {
         param($Uri, $Headers, $Method, $Body)
@@ -678,6 +709,18 @@ if ($Outcome -eq 'needs-human') { Write-Output 'WATCHER_HUMAN_REQUEST: Choose th
     Assert-True ($script:publishedHumanRequestBody -match 'published by the watcher') 'Published requests identify the watcher as publisher'
     Assert-True (-not (Publish-LaunchHumanRequestComment $commentIssue $commentLaunch $commentConfig $testToken $publishRequest)) 'A later poll does not duplicate the human request comment'
     Assert-Equal $script:publishedHumanRequests 1 'Duplicate-poll protection avoids a second Issue comment'
+
+    $delegationLogPath = Join-Path $temporaryRoot 'delegation.jsonl'
+    [IO.File]::WriteAllText($delegationLogPath, '{"version":1,"type":"watcher-agent-event","event":"delegation","delegationRequested":true,"delegatesCreated":0,"delegationRefusalReason":"The work cannot be divided safely."}' + "`n" + '{"version":1,"type":"watcher-agent-event","event":"outcome","outcome":"commit-request","message":"incorrect success"}' + "`n" + '{"version":1,"type":"watcher-agent-event","event":"exit","exitCode":0}', [Text.UTF8Encoding]::new($false))
+    $delegationJsonl = Get-LaunchJsonlStatus -Launch ([pscustomobject]@{ status = 'running'; logPath = $delegationLogPath })
+    Assert-Equal $delegationJsonl.DelegatesCreated 0 'Delegation telemetry records the actual zero delegate count'
+    Assert-Equal $delegationJsonl.DelegationRefusalReason 'The work cannot be divided safely.' 'Delegation telemetry retains the refusal reason'
+    $delegationStatePath = Join-Path $temporaryRoot 'delegation-state\launches.json'
+    Save-IssueLaunchState -State ([pscustomobject]@{ version = 1; launches = @([pscustomobject]@{ repository = 'example-org/example-repo'; issue = 'example-org/example-repo#503'; issueNumber = 503; status = 'running'; pid = 2147483647; processStartedAt = '2026-08-30T12:00:00.0000000+00:00'; logPath = $delegationLogPath; delegationRequested = $true; delegatesCreated = 0; delegationRefusalReason = '' }) }) -Path $delegationStatePath
+    Invoke-LaunchMonitoring -Config ([pscustomobject]@{ Launch = [pscustomobject]@{ Enabled = $true; StatePath = $delegationStatePath } }) -PollResult ([pscustomobject]@{ Events = @() }) -GitHubToken $testToken
+    $delegationTerminal = (Read-IssueLaunchState -Path $delegationStatePath).launches[0]
+    Assert-Equal $delegationTerminal.status 'needs-human' 'An unsafe division cannot be reported as a successful multi-agent launch'
+    Assert-True ($delegationTerminal.delegationRefusalReason -match 'cannot be divided safely') 'The terminal multi-agent refusal retains its diagnostic'
 
     # If every GitHub repository fails to poll, terminal JSONL is still local
     # evidence: it must be reconciled and persisted without a synthetic Issue
