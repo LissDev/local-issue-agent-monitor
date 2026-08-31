@@ -170,12 +170,24 @@ Observation is the default and is read-only:
 ```
 
 `-Follow` requires an already active watcher for the same configuration. It
-shows the watcher's PID, last heartbeat, configuration, tracked launch state,
+shows the watcher's PID, last heartbeat, configuration, and active launch state,
 and only JSONL events appended after Follow started. It never polls GitHub,
 creates a worktree, changes launch state or Issue labels, or starts/stops a
 process. If the heartbeat is absent, stale, or belongs to a different process,
 Follow reports that there is nothing to observe and exits; it never starts a
 watcher automatically.
+
+The Watch and Follow activity lists exclude completed launches and attempts
+superseded by a later rerun. Those records remain in launch state for audit and
+can be inspected without polling GitHub or changing state:
+
+```powershell
+.\Invoke-IssueMonitor.ps1 -History
+```
+
+History marks each row as `completed` or `superseded` and includes its recorded
+attempt and timestamps. A prior `needs-human` attempt therefore appears as a
+superseded historical record, not as an active request.
 
 All console timestamps use the local time zone of the machine running the
 monitor and include a numeric offset (for example, `2026-08-30 12:00:00 +03:00`).
