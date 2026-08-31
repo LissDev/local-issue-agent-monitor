@@ -171,7 +171,7 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
         return [pscustomobject]@{
             Enabled = $false; WorktreeDirectory = $null; StatePath = (Get-IssueLaunchStatePath)
             RepositoryPaths = @{}; CodexCommand = 'codex'
-            Runner = [pscustomobject]@{ Type = 'codex'; Command = 'codex'; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
+            Runner = [pscustomobject]@{ Type = 'codex'; Command = 'codex'; ApprovalMode = 'default'; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
         }
     }
     $enabled = $false
@@ -197,7 +197,7 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
     $runnerSource = if ($null -ne $Launch.PSObject.Properties['runner']) { $Launch.runner } else { $null }
     if ($null -eq $runnerSource) {
         # Existing configurations select the built-in runner without migration.
-        $runner = [pscustomobject]@{ Type = 'codex'; Command = $codexCommand; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
+        $runner = [pscustomobject]@{ Type = 'codex'; Command = $codexCommand; ApprovalMode = 'default'; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
     }
     else {
         if ($runnerSource -is [string] -or $null -eq $runnerSource.PSObject.Properties['type']) {
@@ -222,13 +222,20 @@ function ConvertTo-IssueMonitorLaunchConfiguration {
         }
         $promptTransport = if ($null -ne $runnerSource.PSObject.Properties['promptTransport']) { ([string]$runnerSource.promptTransport).Trim().ToLowerInvariant() } else { '' }
         $promptFileArgument = if ($null -ne $runnerSource.PSObject.Properties['promptFileArgument']) { [string]$runnerSource.promptFileArgument } else { '' }
+        $approvalMode = 'default'
+        if ($null -ne $runnerSource.PSObject.Properties['approvalMode']) {
+            if ($runnerSource.approvalMode -isnot [string]) { throw "Configuration value 'launch.runner.approvalMode' must be 'default' or 'approve-for-me'." }
+            $approvalMode = ([string]$runnerSource.approvalMode).Trim().ToLowerInvariant()
+            if ($approvalMode -notin @('default', 'approve-for-me')) { throw "Configuration value 'launch.runner.approvalMode' must be 'default' or 'approve-for-me'." }
+        }
         if ($runnerType -eq 'codex') {
             if ($runnerArguments.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($promptTransport) -or -not [string]::IsNullOrWhiteSpace($promptFileArgument)) {
-                throw "Configuration value 'launch.runner' for the Codex runner supports only 'type' and optional 'command'."
+                throw "Configuration value 'launch.runner' for the Codex runner supports only 'type', optional 'command', and optional 'approvalMode'."
             }
-            $runner = [pscustomobject]@{ Type = 'codex'; Command = $runnerCommand; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
+            $runner = [pscustomobject]@{ Type = 'codex'; Command = $runnerCommand; ApprovalMode = $approvalMode; Arguments = @(); PromptTransport = 'stdin'; PromptFileArgument = '' }
         }
         else {
+            if ($null -ne $runnerSource.PSObject.Properties['approvalMode']) { throw "Configuration value 'launch.runner.approvalMode' is supported only for the Codex runner." }
             if ($promptTransport -notin @('stdin', 'file')) { throw "Configuration value 'launch.runner.promptTransport' for the external runner must be 'stdin' or 'file'." }
             if ($promptTransport -eq 'file' -and [string]::IsNullOrWhiteSpace($promptFileArgument)) { throw "Configuration value 'launch.runner.promptFileArgument' is required when promptTransport is 'file'." }
             if ($promptTransport -eq 'stdin' -and -not [string]::IsNullOrWhiteSpace($promptFileArgument)) { throw "Configuration value 'launch.runner.promptFileArgument' is supported only when promptTransport is 'file'." }
@@ -272,7 +279,10 @@ function Test-IssueMonitorLaunchConfiguration {
     # Reuse the normalizer so manually-constructed configuration receives the
     # same validation as JSON configuration.
     $runnerSource = if ($null -eq $Launch.PSObject.Properties['Runner'] -or $null -eq $Launch.Runner) { $null }
-        elseif ([string]$Launch.Runner.Type -eq 'codex') { [pscustomobject]@{ type = 'codex'; command = $Launch.Runner.Command } }
+        elseif ([string]$Launch.Runner.Type -eq 'codex') {
+            $approvalMode = if ($null -ne $Launch.Runner.PSObject.Properties['ApprovalMode']) { $Launch.Runner.ApprovalMode } else { 'default' }
+            [pscustomobject]@{ type = 'codex'; command = $Launch.Runner.Command; approvalMode = $approvalMode }
+        }
         else { [pscustomobject]@{ type = $Launch.Runner.Type; command = $Launch.Runner.Command; arguments = @($Launch.Runner.Arguments); promptTransport = $Launch.Runner.PromptTransport; promptFileArgument = $Launch.Runner.PromptFileArgument } }
     $source = [pscustomobject]@{
         enabled = $Launch.Enabled; worktreeDirectory = $Launch.WorktreeDirectory
@@ -856,15 +866,18 @@ function ConvertTo-IssueLaunchCommandLineArgument {
 function New-CodexIssueAgentRunner {
     [CmdletBinding()]
     param(
-        [string]$Command = 'codex'
+        [string]$Command = 'codex',
+        [ValidateSet('default', 'approve-for-me')][string]$ApprovalMode = 'default'
     )
 
     if ([string]::IsNullOrWhiteSpace($Command)) { throw 'The Codex runner command cannot be empty.' }
+    $approvalArguments = if ($ApprovalMode -eq 'approve-for-me') { ' --approve-for-me' } else { '' }
     return [pscustomobject]@{
         Name = 'codex'
         EventVersion = $script:IssueAgentRunnerEventVersion
         Command = $Command
-        CommandDescription = ($Command + ' exec --sandbox workspace-write --json -- -')
+        ApprovalMode = $ApprovalMode
+        CommandDescription = ($Command + ' exec --sandbox workspace-write --json' + $approvalArguments + ' -- -')
         Discover = {
             param($Runner)
             $resolved = Get-Command -Name ([string]$Runner.Command) -ErrorAction SilentlyContinue
@@ -873,7 +886,7 @@ function New-CodexIssueAgentRunner {
         }
         Start = {
             param($Runner, $Prompt, $LogPath, $StateDirectory, $WorkingDirectory)
-            Start-CodexIssueAgentRunnerProcess -Command ([string]$Runner.Command) -Prompt $Prompt -LogPath $LogPath -StateDirectory $StateDirectory -WorkingDirectory $WorkingDirectory
+            Start-CodexIssueAgentRunnerProcess -Command ([string]$Runner.Command) -ApprovalMode ([string]$Runner.ApprovalMode) -Prompt $Prompt -LogPath $LogPath -StateDirectory $StateDirectory -WorkingDirectory $WorkingDirectory
         }
     }
 }
@@ -922,7 +935,10 @@ function New-IssueAgentRunnerFromConfiguration {
         return New-CodexIssueAgentRunner -Command ([string]$Launch.CodexCommand)
     }
     $runner = $Launch.Runner
-    if ([string]$runner.Type -eq 'codex') { return New-CodexIssueAgentRunner -Command ([string]$runner.Command) }
+    if ([string]$runner.Type -eq 'codex') {
+        $approvalMode = if ($null -ne $runner.PSObject.Properties['ApprovalMode']) { [string]$runner.ApprovalMode } else { 'default' }
+        return New-CodexIssueAgentRunner -Command ([string]$runner.Command) -ApprovalMode $approvalMode
+    }
     if ([string]$runner.Type -eq 'external') {
         return New-ExternalIssueAgentRunner -Command ([string]$runner.Command) -Arguments @($runner.Arguments) -PromptTransport ([string]$runner.PromptTransport) -PromptFileArgument ([string]$runner.PromptFileArgument)
     }
@@ -978,6 +994,7 @@ function Start-CodexIssueAgentRunnerProcess {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Command,
+        [ValidateSet('default', 'approve-for-me')][string]$ApprovalMode = 'default',
         [Parameter(Mandatory)][string]$Prompt,
         [Parameter(Mandatory)][string]$LogPath,
         [Parameter(Mandatory)][string]$StateDirectory,
@@ -996,6 +1013,7 @@ Remove-Item -LiteralPath Env:GITHUB_ISSUES_TOKEN -ErrorAction SilentlyContinue
 `$logPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$logBase64'))
 `$workingDirectory = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$workingDirectoryBase64'))
 `$command = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$commandBase64'))
+`$approvalMode = '$ApprovalMode'
 `$utf8NoBom = [Text.UTF8Encoding]::new(`$false)
 [Console]::OutputEncoding = `$utf8NoBom
 `$OutputEncoding = `$utf8NoBom
@@ -1034,7 +1052,8 @@ function Get-CodexAgentMessage {
     } catch { }
     return ''
 }
-`$prompt | & `$command exec --sandbox workspace-write --json -- - 2>`$null | ForEach-Object {
+`$approvalArguments = if (`$approvalMode -eq 'approve-for-me') { @('--approve-for-me') } else { @() }
+`$prompt | & `$command exec --sandbox workspace-write --json @approvalArguments -- - 2>`$null | ForEach-Object {
     `$raw = `$_.ToString()
     `$agentText = Get-CodexAgentMessage `$raw
     if ([string]::IsNullOrWhiteSpace(`$agentText)) { Write-NormalizedAgentEvent -Event 'activity' -Message `$raw }
