@@ -17,10 +17,12 @@
     "repositoryPaths": {
       "example-org/example-repo": "C:\\src\\example-repo"
     },
+    "executionModeLabel": "execution:multi-agent",
     "codexCommand": "codex",
     "runner": {
       "type": "codex",
-      "approvalMode": "default"
+      "approvalMode": "default",
+      "delegationAvailable": false
     }
   }
 }
